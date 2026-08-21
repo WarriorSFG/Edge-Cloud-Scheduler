@@ -33,6 +33,26 @@ static int    KN_CONS;        // consolidate assignments onto few clouds when la
 static double KN_CONS_PEN;    // spill penalty (multiples of 2*lat) for out-of-set clouds
 static double KN_CHUNK_MINS;  // only chunk prefills longer than this many S
 static double KN_CHUNK_TPP;   // minimum tpot pressure before chunking engages
+// --- stage arbitration: base priorities (were hardcoded constants) ---------
+static double KN_BASE_W;      // global weight on the six stage base priorities
+static double KN_B_DPOST, KN_B_PPOST, KN_B_DPRE, KN_B_PPRE, KN_B_DPROC, KN_B_PPROC;
+static double B_DPOST, B_PPOST, B_DPRE, B_PPRE, B_DPROC, B_PPROC;  // = KN_BASE_W * KN_B_*
+// --- age-score shape: the TDR/TPOT tilt (was hardcoded) -------------------
+static double KN_AGE_FLOOR;   // constant floor in the age multiplier
+static double KN_AGE_AW;      // how strongly the test's w_tp tilts the tilt
+static double KN_AGE_PRESS;   // how strongly live SLO pressure tilts it
+static double KN_AGE_SLO_W;   // weight of the SLO-relative urgency bonus
+static int    KN_AGE_NORM;    // 1: age in SLO-relative units instead of raw ms
+static double KN_PPRE_AGECAP; // cap on the prefill-admission wait that bids for E
+// --- remote choice / chunking / regime detection --------------------------
+static double KN_DECQ;        // weight on the immediate decode queue at a remote
+static double KN_CHUNK_RATIO; // tpot-vs-tdr excess ratio required to chunk
+static int    KN_CHUNK_PRED;  // 1: chunk when decode is assigned to k, not only queued
+static double KN_LAT_MULT;    // link round-trips charged per decode hop
+static double KN_GATE_TDR;    // TDR fraction at which admission gating is overridden
+static int    KN_HOLD_ACT;    // auto-hold once this many requests are decoding
+static double KN_HOLD_AW;     // w_tp above which auto-hold turns on
+static int    KN_WAVE_CAPS_BATCH; // 1: the wave target also caps group size
 
 static void loadKnobs() {
     KN_SPT          = envi("V4_SPT", 1);
@@ -54,6 +74,33 @@ static void loadKnobs() {
     KN_CONS_PEN     = envd("V4_CONS_PEN", 20.0);
     KN_CHUNK_MINS   = envd("V4_CHUNK_MINS", 30.0);
     KN_CHUNK_TPP    = envd("V4_CHUNK_TPP", 0.8);
+
+    KN_BASE_W       = envd("V4_BASE_W", 1.0);
+    KN_B_DPOST      = envd("V4_B_DPOST", 3.2);
+    KN_B_PPOST      = envd("V4_B_PPOST", 2.4);
+    KN_B_DPRE       = envd("V4_B_DPRE", 2.0);
+    KN_B_PPRE       = envd("V4_B_PPRE", 1.2);
+    KN_B_DPROC      = envd("V4_B_DPROC", 2.0);
+    KN_B_PPROC      = envd("V4_B_PPROC", 1.2);
+    B_DPOST = KN_BASE_W * KN_B_DPOST;  B_PPOST = KN_BASE_W * KN_B_PPOST;
+    B_DPRE  = KN_BASE_W * KN_B_DPRE;   B_PPRE  = KN_BASE_W * KN_B_PPRE;
+    B_DPROC = KN_BASE_W * KN_B_DPROC;  B_PPROC = KN_BASE_W * KN_B_PPROC;
+
+    KN_AGE_FLOOR    = envd("V4_AGE_FLOOR", 0.5);
+    KN_AGE_AW       = envd("V4_AGE_AW", 1.0);
+    KN_AGE_PRESS    = envd("V4_AGE_PRESS", 1.0);
+    KN_AGE_SLO_W    = envd("V4_AGE_SLO_W", 3.0);
+    KN_AGE_NORM     = envi("V4_AGE_NORM", 0);
+    KN_PPRE_AGECAP  = envd("V4_PPRE_AGECAP", 1000000000000.0);
+
+    KN_DECQ         = envd("V4_DECQ", 0.0);
+    KN_CHUNK_RATIO  = envd("V4_CHUNK_RATIO", 2.0);
+    KN_CHUNK_PRED   = envi("V4_CHUNK_PRED", 0);
+    KN_LAT_MULT     = envd("V4_LAT_MULT", 2.0);
+    KN_GATE_TDR     = envd("V4_GATE_TDR", 0.3);
+    KN_HOLD_ACT     = envi("V4_HOLD_ACT", 0);
+    KN_HOLD_AW      = envd("V4_HOLD_AW", 0.75);
+    KN_WAVE_CAPS_BATCH = envi("V4_WAVE_CAPS_BATCH", 1);
 }
 
 // ------------------------------------------------------------------ tables
@@ -208,11 +255,11 @@ static inline int pendingEvents() {
 static inline void trim(Ring &q, St want) { while (!q.empty() && st[q.front()] != want) q.pop(); }
 static inline int drain(Ring &q, St want, int cap) {
     int n = 0;
-    while (!q.empty() && n < cap) { 
-        int32_t r = q.front(); 
-        q.pop(); 
+    while (!q.empty() && n < cap) {
+        int32_t r = q.front();
+        q.pop();
         if (st[r] == want) {
-            batchBuf[n++] = r; 
+            batchBuf[n++] = r;
         }
     }
     return n;
@@ -241,7 +288,7 @@ static inline double awEff() { return cHopeless ? 1.0 : aw; }
 // --- link-latency dominance ------------------------------------------------
 static inline bool latDominant() {
     int A = max(1, activeDecTotal);
-    return 2.0 * latMs > (S + T_decode_proc.at((double)A));
+    return KN_LAT_MULT * latMs > (S + T_decode_proc.at((double)A));
 }
 static inline int cloudsInUse() {
     int u = 0;
@@ -252,21 +299,28 @@ static inline int bestCloudCount() {
     int A = max(4, activeDecTotal);
     int bestU = 1; double bestF = 1e300;
     for (int U = 1; U <= K; ++U) {
-        double f = 2.0 * latMs * U + S + T_decode_proc.at(ceil((double)A / U));
+        double f = KN_LAT_MULT * latMs * U + S + T_decode_proc.at(ceil((double)A / U));
         if (f < bestF) { bestF = f; bestU = U; }
     }
     return bestU;
 }
 
+// KN_AGE_NORM=0 keeps the historical raw-millisecond age; =1 measures lateness
+// relative to each stage's own SLO, so prefill and decode compete on the same
+// scale the score actually uses.
 static inline double ageD(double w) {
     double r = w / SLO2; if (r > 5) r = 5 + log1p(r - 5);
-    return w * (0.5 + awEff() + tpotPressure) + 3.0 * r;
+    double base = KN_AGE_NORM ? (w / SLO2) : w;
+    return base * (KN_AGE_FLOOR + KN_AGE_AW * awEff() + KN_AGE_PRESS * tpotPressure)
+           + KN_AGE_SLO_W * r;
 }
 static inline double ageP(double w) {
     double r = w / SLO1; if (r > 5) r = 5 + log1p(r - 5);
-    return w * (0.5 + (1.0 - awEff()) + tdrPressure) + 3.0 * r;
+    double base = KN_AGE_NORM ? (w / SLO1) : w;
+    return base * (KN_AGE_FLOOR + KN_AGE_AW * (1.0 - awEff()) + KN_AGE_PRESS * tdrPressure)
+           + KN_AGE_SLO_W * r;
 }
-static const double B_DPOST = 3.2, B_PPOST = 2.4, B_DPRE = 2.0, B_PPRE = 1.2, B_DPROC = 2.0, B_PPROC = 1.2;
+// B_* are set from V4_BASE_W * V4_B_* in loadKnobs().
 
 // ------------------------------------------------------------------ helpers
 static inline int oldestPend() { trim(pendRing, PEND_PPRE); return pendRing.empty() ? -1 : pendRing.front(); }
@@ -294,7 +348,13 @@ static inline int pickPref(int k) {
 static inline bool holdActive() {
     if (KN_HOLD == 0) return false;
     if (KN_HOLD == 1) return true;
-    return awEff() >= 0.75 || (slo1Free && slo2Free);
+    // Auto mode used to look only at the test's weights. But the local computer
+    // runs four of the six stages and is the resource that actually saturates,
+    // and once it is saturated batching shortens the queue and so helps TPOT
+    // too -- holding is not a throughput-only trade. KN_HOLD_ACT makes the
+    // decision load-aware; 0 keeps the historical weights-only rule.
+    if (KN_HOLD_ACT > 0 && activeDecTotal >= KN_HOLD_ACT) return true;
+    return awEff() >= KN_HOLD_AW || (slo1Free && slo2Free);
 }
 
 static inline int waveCap(const RateOptimizer &R, int active) {
@@ -311,7 +371,7 @@ static inline bool holdSatisfied(double t, Ring &q, St want, int nReady, int tar
         if (nReady >= latTarget) return true;
         trim(q, want);
         if (!q.empty()) {
-            double wcap = 2.0 * latMs * cloudsInUse();
+            double wcap = KN_LAT_MULT * latMs * cloudsInUse();
             if (!slo2Free) wcap = min(wcap, 0.5 * SLO2);
             wcap = max(wcap, 4.0 * S);
             if (t - q.frontTs() >= wcap) return true;
@@ -332,7 +392,7 @@ static inline bool holdSatisfied(double t, Ring &q, St want, int nReady, int tar
 static inline bool gateOK(double t) {
     if (activeDecTotal == 0) return true;
     int old = oldestPend();
-    if (old >= 0 && t - arrOf[old] > 0.3 * SLO1 && !slo1Free) return true;
+    if (old >= 0 && t - arrOf[old] > KN_GATE_TDR * SLO1 && !slo1Free) return true;
     double backlog = max(0.0, upFreeAt - t);
     bool tpMode = (awEff() >= 0.7) || (slo2Free && slo1Free);
     if (tpMode) return prefUpQueued < KN_UPPRE_MAX_TP;
@@ -353,14 +413,20 @@ static inline int bestRemote(double t) {
                 if (prefBacklogMs[a] != prefBacklogMs[b]) return prefBacklogMs[a] < prefBacklogMs[b];
                 return a < b;
             });
-            for (int i = U; i < K; ++i) consPen[order[i]] = KN_CONS_PEN * 2.0 * latMs;
+            for (int i = U; i < K; ++i) consPen[order[i]] = KN_CONS_PEN * KN_LAT_MULT * latMs;
         }
     }
     int best = 0; double bestSc = 1e300;
     for (int k = 0; k < K; ++k) {
+        // prefBacklogMs already covers prefill committed to k but not yet
+        // uploaded; what was missing is the decode work that is queued at k or
+        // in flight to it right now, which is what actually delays the next
+        // D PROC there.
+        double decQ = KN_DECQ * (double)(dprocReady[k].size() + decUpInflight[k])
+                    * (S + T_decode_proc.at(1.0));
         double sc = prefBacklogMs[k] + max(0.0, busyUntil[k] - t)
                   + KN_DECW * activeDec[k] * decCost * max(4.0, 0.5 * avgLoutEst())
-                  + consPen[k];
+                  + decQ + consPen[k];
         if (sc < bestSc) { bestSc = sc; best = k; }
     }
     return best;
@@ -369,13 +435,16 @@ static inline int bestRemote(double t) {
 static inline int pieceEnd(int rid, int k) {
     int ls = layersDone[rid], L = numLayers, lrem = L - ls;
     if (!KN_CHUNK || L <= 1 || lrem <= 1) return L;
-    bool decodeBlocked = dprocReady[k].size() > 0 || decUpInflight[k] > 0;
+    // KN_CHUNK_PRED=1 also chunks when decode merely *lives* on k, so a long
+    // P PROC cannot start just before that request's next decode hop arrives.
+    bool decodeBlocked = dprocReady[k].size() > 0 || decUpInflight[k] > 0
+                      || (KN_CHUNK_PRED && activeDec[k] > 0);
     if (!decodeBlocked) return L;
     if (slo2Free || wC <= 1e-12 || cHopeless) return L;
     double tpotRel = max(0.0, gProjTpot / SLO2 - 1.0);
     double tdrRel  = max(0.0, gProjTdr  / SLO1 - 1.0);
     if (gProjTpot < KN_CHUNK_TPP * SLO2) return L;
-    if (tpotRel <= 2.0 * tdrRel) return L;
+    if (tpotRel <= KN_CHUNK_RATIO * tdrRel) return L;
     double remaining = (double)lrem / L * fullProcDur[rid];
     if (remaining <= max(KN_CHUNK_MINS * S, 0.5 * SLO2)) return L;
     double G = max(KN_CHUNK_SMULT * S, 0.25 * SLO2);
@@ -550,7 +619,11 @@ int main() {
                 double sDPOST = dpostGo ? B_DPOST + ageD(t - dpostReady.frontTs()) : -1e300;
                 double sPPOST = ppost >= 0 ? B_PPOST + ageP(t - qPPOST.frontTs()) : -1e300;
                 double sDPRE  = dpreGo ? B_DPRE + ageD(t - dpreReady.frontTs()) : -1e300;
-                double sPPRE  = ppreGo ? B_PPRE + ageP(t - arrOf[oldest >= 0 ? oldest : ppre]) : -1e300;
+                // An arrival backlog makes this wait grow without bound, which
+                // lets admission outbid every decode stage under overload.
+                double ppreWait = t - arrOf[oldest >= 0 ? oldest : ppre];
+                if (ppreWait > KN_PPRE_AGECAP) ppreWait = KN_PPRE_AGECAP;
+                double sPPRE  = ppreGo ? B_PPRE + ageP(ppreWait) : -1e300;
 
                 int pick = -1; double best = -1e299;
                 if (sDPOST > best) { best = sDPOST; pick = 0; }
@@ -559,7 +632,10 @@ int main() {
                 if (sPPRE  > best) { best = sPPRE;  pick = 3; }
 
                 if (pick == 0) {
-                    int n = drain(dpostReady, PEND_DPOST, max(1, min(R_dpost.bestSize(nDPost), dpostTarget)));
+                    int dpostCap = KN_WAVE_CAPS_BATCH
+                                 ? min(R_dpost.bestSize(nDPost), dpostTarget)
+                                 : R_dpost.bestSize(nDPost);
+                    int n = drain(dpostReady, PEND_DPOST, max(1, dpostCap));
                     if (n > 0) {
                         int len = sprintf(outBuf[na], "E D POST -1 %d", n);
                         for (int j = 0; j < n; ++j) { len += sprintf(outBuf[na] + len, " %d", batchBuf[j]); st[batchBuf[j]] = IN_DPOST; }
@@ -573,7 +649,8 @@ int main() {
                     }
                 } else if (pick == 2) {
                     int cap;
-                    if (KN_LATHOLD && latDominant()) cap = R_dpre.bestSize(nDPre);
+                    if ((KN_LATHOLD && latDominant()) || !KN_WAVE_CAPS_BATCH)
+                        cap = R_dpre.bestSize(nDPre);
                     else cap = min(R_dpre.bestSize(nDPre), dpreTarget);
                     int n = drain(dpreReady, PEND_DPRE, max(1, cap));
                     if (n > 0) {

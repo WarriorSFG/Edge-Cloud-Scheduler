@@ -39,6 +39,40 @@ PROFILES = ("latency_stress", "throughput_stress", "mixed_load", "large_R",
             "small_K", "deep", "shallow")
 ALL_PROFILES = PROFILES + ("mixed",)
 
+# Round-robining the 7 profiles gives each a 1/7 share of the objective, which
+# hands 29% of the weight to the four *corner* profiles (both stress corners
+# plus the two degenerate-mechanic ones). The statement says degenerate values
+# "occur", not that they are a seventh of the set each, so uniform weighting
+# almost certainly over-weights corners relative to a real 20-test set.
+# PROFILE_MIX["balanced"] is an explicit guess at a finals-like shape; it is a
+# judgement call, and --profile_mix uniform reverts to the old behaviour.
+PROFILE_MIX: dict[str, dict[str, int]] = {
+    "uniform": {p: 1 for p in PROFILES},
+    "balanced": {"mixed_load": 5, "large_R": 3, "deep": 3, "latency_stress": 3,
+                 "throughput_stress": 3, "small_K": 2, "shallow": 1},
+}
+
+
+def profile_sequence(n_cases: int, mix: str = "balanced") -> list[str]:
+    """A deterministic, interleaved profile order with the requested weights.
+
+    Interleaved rather than blocked so that any *prefix* of the pool is
+    representative -- the median pruner judges trials on a prefix, and a
+    blocked order would judge them on one profile alone.
+    """
+    weights = PROFILE_MIX[mix]
+    order = [p for p in PROFILES if weights.get(p, 0) > 0]
+    out: list[str] = []
+    credit = {p: 0.0 for p in order}
+    total = float(sum(weights[p] for p in order))
+    for _ in range(n_cases):
+        for p in order:
+            credit[p] += weights[p] / total
+        pick = max(order, key=lambda p: (credit[p], -order.index(p)))
+        credit[pick] -= 1.0
+        out.append(pick)
+    return out
+
 # --- statement "Constraints" -------------------------------------------------
 MAX_R = 2000
 MAX_LIN = 4096
@@ -155,7 +189,7 @@ def _requests(rng: random.Random, profile: str, token_budget: int, max_R: int,
     the score. Loaded cases are the ones where scheduling decisions matter.
     """
     if profile == "large_R":
-        R = rng.randint(400, max_R)
+        R = rng.randint(min(400, max_R), max_R)   # max_R may be below 400
     else:
         choices = [c for c in (1, 2, 5, 20, 60, 150, 400, 900) if c <= max_R]
         R = rng.choice(choices or [max_R])
@@ -474,7 +508,7 @@ def generate(n_cases: int, seed: int, profile: str = "mixed",
              token_budget: int = TOKEN_BUDGET, max_R: int = MAX_R,
              probe: bool = False, binary: str = "./scheduler",
              timeout_s: float = 120.0, workers: int = 1,
-             probe_rounds: int = 2) -> list[dict]:
+             probe_rounds: int = 2, mix: str = "balanced") -> list[dict]:
     """Stratified batch. profile='mixed' round-robins all concrete profiles.
 
     With probe=True the scoring line of every case is re-anchored on a measured
@@ -483,9 +517,9 @@ def generate(n_cases: int, seed: int, profile: str = "mixed",
     done once per pool, not once per trial.
     """
     rng = random.Random(seed)
-    pool = list(PROFILES) if profile == "mixed" else [profile]
-    cases = [make_case(rng, pool[i % len(pool)], token_budget, max_R)
-             for i in range(n_cases)]
+    seq = (profile_sequence(n_cases, mix) if profile == "mixed"
+           else [profile] * n_cases)
+    cases = [make_case(rng, seq[i], token_budget, max_R) for i in range(n_cases)]
     return (_probe_pool(cases, binary, timeout_s, workers, probe_rounds)
             if probe else cases)
 
@@ -575,13 +609,15 @@ def main() -> None:
     ap.add_argument("--binary", default="./scheduler")
     ap.add_argument("--timeout_s", type=float, default=120.0)
     ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--profile_mix", choices=tuple(PROFILE_MIX), default="balanced")
     ap.add_argument("--summary", action="store_true")
     a = ap.parse_args()
 
     cases = (edge_cases(a.seed, a.token_budget, a.probe, a.binary, a.timeout_s)
              if a.edge_cases
              else generate(a.n_cases, a.seed, a.profile, a.token_budget, a.max_R,
-                           a.probe, a.binary, a.timeout_s, a.workers))
+                           a.probe, a.binary, a.timeout_s, a.workers,
+                           mix=a.profile_mix))
     with open(a.out, "w") as f:
         for c in cases:
             f.write(json.dumps(c) + "\n")

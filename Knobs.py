@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Single source of truth for the V4_* scheduler knobs and their search bounds.
 
 Defaults mirror ``loadKnobs()`` in scheduler.cpp exactly -- ``verify_against_cpp()``
@@ -101,6 +102,82 @@ KNOBS: tuple[Knob, ...] = (
          doc="only chunk prefills longer than this many S"),
     Knob("V4_CHUNK_TPP", "float", 0.8, 0.0, 1.0,
          doc="minimum tpot pressure before chunking engages"),
+
+    # ---------------------------------------------------------------------
+    # Added after static analysis: these were hardcoded constants that shape
+    # scheduling decisions but that the search could never reach. Every
+    # default equals the previous hardcoded value, so the seeded trial
+    # reproduces the old policy exactly.
+    # ---------------------------------------------------------------------
+
+    # -- stage arbitration on the local computer and at each remote --------
+    # score = B_stage + age(wait). B_* were 1.2-3.2 while age is in raw ms, so
+    # the base ordering only ever broke sub-millisecond ties. V4_BASE_W scales
+    # all six together, which is the axis that lets a stage *preference*
+    # actually outrank "whoever waited longest".
+    Knob("V4_BASE_W", "logfloat", 1.0, 0.05, 500.0,
+         doc="global weight on the six stage base priorities"),
+    Knob("V4_B_DPOST", "float", 3.2, 0.0, 8.0, doc="base priority: D POST (emits tokens)"),
+    Knob("V4_B_PPOST", "float", 2.4, 0.0, 8.0, doc="base priority: P POST (ends TDR)"),
+    Knob("V4_B_DPRE", "float", 2.0, 0.0, 8.0, doc="base priority: D PRE"),
+    Knob("V4_B_PPRE", "float", 1.2, 0.0, 8.0, doc="base priority: P PRE (admission)"),
+    Knob("V4_B_DPROC", "float", 2.0, 0.0, 8.0, doc="base priority: D PROC at a remote"),
+    Knob("V4_B_PPROC", "float", 1.2, 0.0, 8.0, doc="base priority: P PROC at a remote"),
+
+    # -- age-score shape: the TDR-vs-TPOT tilt ----------------------------
+    # This tilt was a fixed function of the test's own w_tp with no tunable
+    # part at all, even though it is the single most consequential dial in the
+    # policy.
+    Knob("V4_AGE_FLOOR", "float", 0.5, 0.0, 3.0,
+         doc="constant floor in the age multiplier (0 = tilt purely by weights)"),
+    Knob("V4_AGE_AW", "float", 1.0, 0.0, 3.0,
+         doc="how strongly the test's w_tp tilts prefill vs decode aging"),
+    Knob("V4_AGE_PRESS", "float", 1.0, 0.0, 4.0,
+         doc="how strongly live SLO pressure tilts aging (pressures cap at 1.5)"),
+    Knob("V4_AGE_SLO_W", "float", 3.0, 0.0, 30.0,
+         doc="weight of the SLO-relative urgency bonus"),
+    Knob("V4_AGE_NORM", "cat", 0, choices=(0, 1),
+         doc="1: age in SLO-relative units, so stages compete on the scale the "
+             "score uses instead of on raw milliseconds"),
+    Knob("V4_PPRE_AGECAP", "logfloat", 1e12, 1.0, 1e12,
+         doc="cap (ms) on the admission wait that bids for the local computer; "
+             "an arrival backlog otherwise lets P PRE outbid all decode work"),
+
+    # -- remote choice: a term that was missing, not just mis-weighted -----
+    Knob("V4_DECQ", "float", 0.0, 0.0, 4.0,
+         doc="weight on decode work already queued at / in flight to a remote, "
+             "in units of one decode hop (0 = previous behaviour)"),
+
+    # -- chunking and regime detection ------------------------------------
+    Knob("V4_CHUNK_RATIO", "float", 2.0, 0.0, 10.0,
+         doc="tpot-excess / tdr-excess ratio required before P PROC is chunked; "
+             "at 2.0 chunking almost never fires"),
+    Knob("V4_CHUNK_PRED", "cat", 0, choices=(0, 1),
+         doc="1: chunk when decode is merely assigned to this remote, not only "
+             "when it is already queued (anticipatory instead of reactive)"),
+    Knob("V4_LAT_MULT", "float", 2.0, 0.25, 8.0,
+         doc="link round-trips charged per decode hop; gates the whole "
+             "latency-dominant regime (LATHOLD, CONS, cloud-count choice)"),
+    Knob("V4_GATE_TDR", "float", 0.3, 0.0, 3.0,
+         doc="TDR fraction at which admission gating is overridden; low values "
+             "let a prefill flood through under overload"),
+
+    # -- output-group formation, the local computer's only real lever -------
+    # Measured: the local computer runs at 86-99% while the K remotes idle at
+    # 1-3%, and mean group size collapses to ~1 in exactly the saturated cases
+    # (score ~190) versus 9-17 in the healthy ones (score ~997). Auto-hold was
+    # gated purely on the test's w_tp, i.e. blind to that load.
+    Knob("V4_HOLD_ACT", "int", 0, 0, 64,
+         doc="auto-hold once this many requests are in the decode phase, "
+             "whatever the weights say (0 = old weights-only rule)"),
+    Knob("V4_HOLD_AW", "float", 0.75, 0.0, 1.0,
+         doc="w_tp above which auto-hold turns on; at 0.75 every "
+             "waiting-weighted test ran with batching effectively off"),
+    Knob("V4_WAVE_CAPS_BATCH", "cat", 1, choices=(0, 1),
+         doc="1 (old): the wave target ceil(active/WAVES) also caps group size, "
+             "so switching holding ON can yield SMALLER groups than leaving it "
+             "off. 0: the wave target only decides when to fire, and the group "
+             "is always the rate-optimal size"),
 )
 
 BY_NAME: dict[str, Knob] = {k.name: k for k in KNOBS}
@@ -169,8 +246,19 @@ def parse_cpp_knobs(path: str = "scheduler.cpp") -> dict[str, tuple[str, float]]
     return {m.group(2): (m.group(1), float(m.group(3))) for m in _CPP_PAT.finditer(src)}
 
 
-def verify_against_cpp(path: str = "scheduler.cpp", strict: bool = True) -> list[str]:
-    """Return a list of mismatches between this registry and scheduler.cpp."""
+def verify_against_cpp(path: str = "scheduler.cpp", strict: bool = True,
+                      check_defaults: bool = False) -> list[str]:
+    """Structural sync check between this registry and scheduler.cpp.
+
+    Only *structure* is an error: a knob the C++ reads but the registry does not
+    know (it would never be tuned), a knob the registry lists that the C++ never
+    reads (it would be tuned to no effect), or an int/float kind mismatch.
+
+    Default values are deliberately NOT compared unless `check_defaults`. Once
+    you bake tuned values into loadKnobs() (see patch_cpp) the C++ defaults are
+    *supposed* to differ from the registry's search priors, and the tuner is
+    unaffected either way because as_env() always emits every knob explicitly.
+    """
     problems: list[str] = []
     try:
         cpp = parse_cpp_knobs(path)
@@ -181,20 +269,69 @@ def verify_against_cpp(path: str = "scheduler.cpp", strict: bool = True) -> list
         problems.append(f"{name}: read by scheduler.cpp but missing from KNOBS")
     for name in BY_NAME.keys() - cpp.keys():
         problems.append(f"{name}: in KNOBS but never read by scheduler.cpp")
-    for name in cpp.keys() & BY_NAME.keys():
+    for name in sorted(cpp.keys() & BY_NAME.keys()):
         fn, dflt = cpp[name]
         knob = BY_NAME[name]
-        want_int = knob.kind in ("int", "cat")
-        if want_int != (fn == "i"):
+        if (knob.kind in ("int", "cat")) != (fn == "i"):
+            problems.append(f"{name}: kind={knob.kind} but scheduler.cpp uses env{fn}")
+        if check_defaults and abs(float(knob.default) - dflt) > 1e-12:
             problems.append(
-                f"{name}: kind={knob.kind} but scheduler.cpp uses env{fn}")
-        if abs(float(knob.default) - dflt) > 1e-12:
-            problems.append(
-                f"{name}: default {knob.default} != scheduler.cpp default {dflt}")
+                f"{name}: registry default {knob.default} != scheduler.cpp {dflt}")
     if problems and strict:
         raise AssertionError("knob registry out of sync with scheduler.cpp:\n  "
                              + "\n  ".join(problems))
     return problems
+
+
+def _cpp_literal(k: Knob, v: float | int) -> str:
+    """Render a knob value as a C++ literal of the right type."""
+    c = k.cast(v)
+    if k.kind in ("int", "cat"):
+        return str(int(c))
+    text = f"{float(c):.10g}"
+    return text if ("." in text or "e" in text or "E" in text) else text + ".0"
+
+
+def patch_cpp(path: str, values: Mapping[str, float | int],
+              out_path: str | None = None) -> list[str]:
+    """Bake knob values into scheduler.cpp as the loadKnobs() defaults.
+
+    The contest judge runs the submitted binary with no environment of its own,
+    so env vars are a tuning harness only -- the tuned values have to live in
+    the source to reach the judge. Rewrites just the default literal of each
+    env{d,i}("V4_*", <default>) call and leaves comments and layout alone.
+    """
+    with open(path) as f:
+        src = f.read()
+    changed: list[str] = []
+
+    def sub(m: "re.Match[str]") -> str:
+        fn, name, old = m.group(1), m.group(2), m.group(3)
+        if name not in BY_NAME:
+            return m.group(0)
+        new = _cpp_literal(BY_NAME[name], values.get(name, BY_NAME[name].default))
+        if new != old:
+            changed.append(f"{name}: {old} -> {new}")
+        return f'env{fn}("{name}", {new})'
+
+    patched = _CPP_PAT.sub(sub, src)
+    with open(out_path or path, "w") as f:
+        f.write(patched)
+    return changed
+
+
+def emit_cpp(values: Mapping[str, float | int] | None = None) -> str:
+    """The loadKnobs() body with these values as defaults, for manual pasting."""
+    lines = ["static void loadKnobs() {"]
+    w = max(len(k.name) for k in KNOBS)
+    for k in KNOBS:
+        fn = "envi" if k.kind in ("int", "cat") else "envd"
+        lit = _cpp_literal(k, (values or {}).get(k.name, k.default))
+        var = "KN_" + k.name[3:]
+        lines.append(f'    {var:<16} = {fn}("{k.name}", {lit});'
+                     f'{"":<{max(0, w - len(k.name))}}  // {k.doc}')
+    lines.append("}")
+    return "\n".join(lines)
 
 
 def describe(values: Mapping[str, float | int] | None = None) -> str:
@@ -204,15 +341,32 @@ def describe(values: Mapping[str, float | int] | None = None) -> str:
         f"{k.name:<{w}} = {env[k.name]:>10}   ({k.doc})" for k in KNOBS)
 
 
-if __name__ == "__main__":
+def main() -> None:
     import argparse
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cpp", default="scheduler.cpp")
     ap.add_argument("--env-file", help="print the knob table for a saved .env")
+    ap.add_argument("--emit-cpp", action="store_true",
+                    help="print a loadKnobs() with --env-file baked in as defaults")
+    ap.add_argument("--patch-cpp", metavar="OUT",
+                    help="write --cpp with --env-file baked in as defaults")
     a = ap.parse_args()
 
     vals = read_env_file(a.env_file) if a.env_file else None
+
+    if a.emit_cpp:
+        print(emit_cpp(vals or {}))
+        return
+    if a.patch_cpp:
+        if not vals:
+            raise SystemExit("--patch-cpp needs --env-file")
+        changed = patch_cpp(a.cpp, vals, a.patch_cpp)
+        print(f"wrote {a.patch_cpp} ({len(changed)} defaults changed)")
+        for c in changed:
+            print("   ", c)
+        return
+
     print(describe(vals))
     print()
     if os.path.exists(a.cpp):
@@ -222,3 +376,7 @@ if __name__ == "__main__":
             print("  -", b)
     else:
         print(f"cpp cross-check skipped ({a.cpp} not found)")
+
+
+if __name__ == "__main__":
+    main()

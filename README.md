@@ -157,22 +157,39 @@ overfitting to this generator's distribution, which no amount of held-out
 validation from the same generator can detect. So spend the budget on *cases*
 and on *independent seeds*, not only on trials.
 
-**Stage 1 -- explore, cheap and wide** (~1h on 8 cores)
+Everything below is packaged as `./run_protocol.sh` (all three stages, with
+the two correctness gates run first) or `--stage {1,2,3}` presets on
+`Trainer.py`. Explicit flags still override a preset, so
+`--stage 2 --n_trials 800` does what it looks like. Run
+`SEED=2 ./run_protocol.sh` a few times for the independent-seed comparison.
+
+**Stage 1 -- explore: many trials, moderate pool** (~2h on 8 cores). TPE needs
+*trials* to search 19 dimensions, and early candidates differ by enough that
+200 cases can rank them.
 
 ```bash
 python3 Trainer.py --study_name s1 --storage sqlite:///s1.db \
-    --n_trials 2000 --train_cases 48 --val_cases 64 \
+    --n_trials 1500 --train_cases 200 --val_cases 200 \
     --token_budget 6000 --timeout_s 600 --n_jobs 7 --eval_every 100 --seed 1
 ```
 
-**Stage 2 -- refine near real scale, warm-started from stage 1** (~3h)
+**Stage 2 -- refine: large pool, warm-started from stage 1** (~6h). Now the
+candidates are close together, so precision matters more than breadth.
 
 ```bash
 cp best_hparams.env s1.env
 python3 Trainer.py --study_name s2 --storage sqlite:///s2.db --seed_env s1.env \
-    --n_trials 600 --train_cases 120 --val_cases 120 \
+    --n_trials 400 --train_cases 2000 --val_cases 400 \
     --token_budget 60000 --timeout_s 900 --n_jobs 7 --eval_every 50 --seed 2
 ```
+
+A 2000-case pool costs ~50 MB per worker and ~100 s per fully-evaluated trial on
+7 cores, so it is entirely practical. Pruning keeps it affordable — a bad config
+dies after a dozen cases. One caveat: this Optuna version's `TPESampler` has no
+`consider_pruned_trials`, so pruned trials do not feed the surrogate model. If
+pruning is killing most trials, the sampler is flying half blind; check that a
+few hundred trials still reach COMPLETE, and pass `--no_prune` for the final
+refinement stage if not.
 
 **Stage 3 -- repeat stages 1-2 under 3-5 different `--seed` values**, then pick
 the winner on a *common* fresh pool at the true constraint limit:
@@ -187,9 +204,28 @@ done
 
 Why these numbers:
 
-* `--train_cases` has to exceed the 19 knobs by a healthy margin or the search
-  fits cases rather than behaviour; 48 -> 120 gives 2.5x -> 6x. This is the
-  single most valuable place to spend extra time.
+* `--train_cases` is by far the most valuable place to spend extra time, and
+  the numbers below say to be much more generous than a knob-count heuristic
+  suggests. Measured on 400 fresh probe-calibrated cases, the per-case *paired*
+  difference between two knob configs has sd ~71 points, so the pool size you
+  need depends entirely on the effect you are trying to resolve:
+
+  | difference you want to resolve | cases needed (95% conf.) |
+  | --- | --- |
+  | 20 pts | 49 |
+  | 10 pts | 193 |
+  | 5 pts  | 772 |
+  | 3 pts  | 2143 |
+
+  Early in a search, candidates differ by tens of points and 50 cases suffice.
+  Late in a search, when you are separating near-optimal configs that differ by
+  2-5 points, you genuinely need 1000-3000. A 24-case batch ranked a known-better
+  config above the defaults in only 86 of 100 random subsamples; 200 cases got
+  it right 100 times out of 100.
+
+  The cost of overfitting to a small batch is directly measurable: a config
+  tuned on a 22-case batch showed +34.6 there but only **+13.5** on 400 unseen
+  cases, so roughly two thirds of the apparent gain was fitting that batch.
 * `--n_trials` — TPE in 19 dimensions is still improving at a few hundred
   trials; 2000 is well past saturation, so stage 1 is where to be generous.
 * `--token_budget` — cheap cases for exploration, near-real cases for stage 2
@@ -207,7 +243,12 @@ Why these numbers:
 * Leave `--rotate_every 0`. With 120 fixed cases, case-overfitting is already
   weak and stationarity is worth more to the sampler.
 * Leave pruning on: the fixed case order makes the median comparison
-  like-for-like, and it buys roughly 3-4x more trials per hour.
+  like-for-like, and it buys roughly 3-4x more trials per hour. Pruning is also
+  what makes a *large* train set affordable — a bad config dies after a dozen
+  cases while a promising one is scored on all of them, which is exactly the
+  cost profile you want. The pruner deliberately does not start until the
+  canary prefix plus 8 real cases have been scored (`--prune_warmup`), because
+  judging a trial on degenerate cases alone would throw away good configs.
 * Do **not** pass `--no_probe` for a real run — it is the calibration that puts
   the scores in a gradient-rich range.
 

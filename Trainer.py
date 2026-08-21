@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Part 3 -- knob tuner for the V4_* env knobs of scheduler.cpp.
 
     python3 Trainer.py --n_trials 200            # tune
@@ -22,10 +21,14 @@ OBJECTIVE
   from case-to-case variation, and TPE then models nothing.
 
 TRAIN / VALIDATION
-  * train set: --train_cases stratified cases + the degenerate canaries,
-    scored every trial. Optionally rotated from a larger reservoir every
-    --rotate_every trials (off by default: rotation breaks the stationarity TPE
-    assumes, and the fixed batch plus a held-out val set is the better trade).
+  * train set: --train_cases stratified cases, scored every trial. The
+    degenerate canaries run first as a LEGALITY GATE and are deliberately not
+    averaged into the objective -- the contest metric is an unweighted mean over
+    20 ordinary tests, and letting six edge cases carry a fifth of the weight
+    (which is what --train_cases 24 did) optimises for the wrong thing.
+    Rotation stays off by default: at --train_cases 200 the fixed batch is
+    already large enough that case-overfitting is weak, and the stationarity TPE
+    assumes is worth more -- more so now that the space is 40-dimensional.
   * val set:   --val_cases cases generated once with a different seed and never
     trained on, scored for the running best every --eval_every trials and again
     at the end. Watch train-minus-val: that gap is overfitting to Generator
@@ -57,7 +60,7 @@ import Knobs
 import Simulator
 
 PRUNER_WARMUP_TRIALS = 8
-PRUNER_STARTUP_CASES = 4
+PRUNER_EXTRA_WARMUP_CASES = 8
 
 # ------------------------------------------------------- worker-side globals --
 _CASES: list[dict] = []
@@ -154,25 +157,66 @@ def suggest(trial: Any) -> dict[str, float | int]:
 
 
 class Objective:
-    def __init__(self, ev: Evaluator, train_idx: list[int], reservoir_idx: list[int],
-                 args: argparse.Namespace) -> None:
+    """Objective = unweighted mean Score over the *main* batch, minus a penalty
+    for any canary that came out illegal.
+
+    Two deliberate departures from the first version:
+
+    * The canaries no longer contribute score mass. They used to sit at the
+      front of the batch and be averaged in, so with the old --train_cases 24
+      the six degenerate cases carried 20% of the objective -- nothing like the
+      contest metric, which is an unweighted mean over 20 ordinary tests.
+    * A canary violation no longer zero-fills the whole trial. It costs
+      --canary_penalty * (fraction of canaries illegal), which keeps illegal
+      configurations firmly out of the running while still giving the sampler a
+      real, ordered value for the rest of the batch. One fragile edge case can
+      no longer make an otherwise-strong region look worthless.
+
+    A violation on a *main* case still scores that case 0, because that is
+    exactly what the contest would award for it.
+    """
+
+    def __init__(self, ev: Evaluator, canary_idx: list[int], main_idx: list[int],
+                 reservoir_idx: list[int], args: argparse.Namespace) -> None:
         self.ev = ev
-        self.train_idx = list(train_idx)
+        self.canary_idx = list(canary_idx)
+        self.main_idx = list(main_idx)
         self.reservoir_idx = list(reservoir_idx)
         self.a = args
         self.n_violations = 0
+        self.canary_fragility: dict[str, int] = {}
 
     def _batch(self, trial_number: int) -> list[int]:
         if self.a.rotate_every <= 0 or not self.reservoir_idx:
-            return self.train_idx
+            return self.main_idx
         rng = random.Random(trial_number // self.a.rotate_every)
-        k = min(len(self.train_idx), len(self.reservoir_idx))
-        return self.train_idx[:self.a.n_canaries] + rng.sample(self.reservoir_idx, k)
+        k = min(len(self.main_idx), len(self.reservoir_idx))
+        return rng.sample(self.reservoir_idx, k)
+
+    def _run_canaries(self, trial: Any, env: dict[str, Any]) -> float:
+        """Return the objective penalty from illegal canaries (0 if all legal)."""
+        if not self.canary_idx:
+            return 0.0
+        bad: list[str] = []
+        for i, res in zip(self.canary_idx, self.ev.run_all(self.canary_idx, env)):
+            if not res.ok:
+                prof = self.ev.cases[i]["profile"]
+                bad.append(f"{prof}({res.violation})")
+                self.n_violations += 1
+                self.canary_fragility[prof] = self.canary_fragility.get(prof, 0) + 1
+        if not bad:
+            return 0.0
+        trial.set_user_attr("canary_violations", "; ".join(bad))
+        print(f"[canary] trial {trial.number}: {len(bad)}/{len(self.canary_idx)} "
+              f"illegal -> {'; '.join(bad)}")
+        return self.a.canary_penalty * len(bad) / len(self.canary_idx)
 
     def __call__(self, trial: Any) -> float:
         import optuna
 
         env = suggest(trial)
+        penalty = self._run_canaries(trial, env)
+
         idxs = self._batch(trial.number)
         scores: list[float] = []
         step = 0
@@ -184,17 +228,17 @@ class Objective:
                     print(f"[violation] trial {trial.number} profile={prof} "
                           f"reason={res.violation}")
                     trial.set_user_attr("violation", f"{prof}: {res.violation}")
+                    scores.append(0.0)
                     if self.a.violation_policy == "zero_fill":
                         scores.extend([0.0] * (len(idxs) - len(scores)))
-                        return mean(scores)
-                    scores.append(0.0)
+                        return mean(scores) - penalty
                 else:
                     scores.append(res.score)
-                trial.report(mean(scores), step)
+                trial.report(mean(scores) - penalty, step)
                 step += 1
             if trial.should_prune():
                 raise optuna.TrialPruned()
-        return mean(scores)
+        return mean(scores) - penalty
 
 
 # ----------------------------------------------------- optuna-free fallback ---
@@ -307,7 +351,8 @@ def dump_best(params: dict[str, float | int], train_score: float, val_score: flo
 
 
 # --------------------------------------------------------------------- main ---
-def build_pools(a: argparse.Namespace) -> tuple[list[dict], list[int], list[int], list[int]]:
+def build_pools(a: argparse.Namespace) -> tuple[list[dict], list[int], list[int],
+                                              list[int], list[int]]:
     """Generate every case up front (probing spawns its own workers, so this
     must happen before the trial pool exists)."""
     print(f"[pool] generating cases (token_budget={a.token_budget}, "
@@ -318,39 +363,59 @@ def build_pools(a: argparse.Namespace) -> tuple[list[dict], list[int], list[int]
                                     a.timeout_s)
     n_reservoir = max(a.pool_size, a.train_cases) if a.rotate_every > 0 else a.train_cases
     train = Generator.generate(n_reservoir, a.seed, "mixed", a.token_budget,
-                               a.max_R, probe, a.binary, a.timeout_s, a.n_jobs)
+                               a.max_R, probe, a.binary, a.timeout_s, a.n_jobs,
+                               mix=a.profile_mix)
     val = Generator.generate(a.val_cases, a.seed + 90_001, "mixed", a.token_budget,
-                             a.max_R, probe, a.binary, a.timeout_s, a.n_jobs)
+                             a.max_R, probe, a.binary, a.timeout_s, a.n_jobs,
+                             mix=a.profile_mix)
 
     cases = canaries + train + val
     n_can = len(canaries)
     canary_idx = list(range(n_can))
-    train_idx = canary_idx + list(range(n_can, n_can + min(a.train_cases, len(train))))
+    main_idx = list(range(n_can, n_can + min(a.train_cases, len(train))))
     reservoir_idx = list(range(n_can, n_can + len(train)))
     val_idx = list(range(n_can + len(train), len(cases)))
     a.n_canaries = n_can
-    print(f"[pool] {len(cases)} cases ({n_can} canaries + {len(train)} train "
-          f"+ {len(val)} val) in {time.monotonic() - t0:.1f}s")
-    return cases, train_idx, reservoir_idx, val_idx
+    print(f"[pool] {len(cases)} cases ({n_can} canaries, legality gate only "
+          f"+ {len(train)} train + {len(val)} val, profile_mix={a.profile_mix}) "
+          f"in {time.monotonic() - t0:.1f}s")
+    return cases, canary_idx, main_idx, reservoir_idx, val_idx
+
+
+STAGES: dict[int, dict[str, Any]] = {
+    # Stage 1 -- explore: many trials, moderate pool, cheap cases.
+    1: dict(n_trials=1500, train_cases=200, val_cases=200, token_budget=6000,
+            eval_every=100, timeout_s=600),
+    # Stage 2 -- refine: large pool for precision, warm-started from stage 1.
+    2: dict(n_trials=400, train_cases=2000, val_cases=400, token_budget=60000,
+            eval_every=50, timeout_s=900),
+    # Stage 3 -- select: no search, score saved configs at the real token limit.
+    3: dict(n_trials=0, train_cases=200, val_cases=400, token_budget=200000,
+            eval_every=0, timeout_s=1800),
+}
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__,
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--stage", type=int, choices=(1, 2, 3))
+    stage_args, _ = pre.parse_known_args()
+
+    ap = argparse.ArgumentParser(description=__doc__, parents=[pre],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--n_trials", type=int, default=200)
-    ap.add_argument("--train_cases", type=int, default=24)
-    ap.add_argument("--val_cases", type=int, default=32)
+    ap.add_argument("--n_trials", type=int, default=1500)
+    ap.add_argument("--train_cases", type=int, default=200)
+    ap.add_argument("--val_cases", type=int, default=200)
     ap.add_argument("--pool_size", type=int, default=200,
                     help="rotation reservoir; only used when --rotate_every > 0")
     ap.add_argument("--rotate_every", type=int, default=0,
                     help="rotate the train batch every N trials (0 = fixed batch)")
-    ap.add_argument("--eval_every", type=int, default=25,
+    ap.add_argument("--eval_every", type=int, default=100,
                     help="validate the running best every N trials")
-    ap.add_argument("--token_budget", type=int, default=6000,
+    ap.add_argument("--token_budget", type=int, default=6000,  # noqa: E501
                     help="cap on sum(L_out) per case; the real limit is 2e5, but "
                          "smaller cases make a tuning run tractable")
     ap.add_argument("--max_R", type=int, default=Generator.MAX_R)
-    ap.add_argument("--timeout_s", type=float, default=120.0)
+    ap.add_argument("--timeout_s", type=float, default=600.0)
     ap.add_argument("--n_jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--binary", default="./scheduler")
@@ -358,15 +423,38 @@ def main() -> None:
     ap.add_argument("--study_name", default="v4_knobs")
     ap.add_argument("--env_out", default="best_hparams.env")
     ap.add_argument("--json_out", default="best_hparams.json")
-    ap.add_argument("--violation_policy", choices=("zero_fill", "continue"),
-                    default="zero_fill")
+    ap.add_argument("--violation_policy", choices=("score_zero", "zero_fill"),
+                    default="score_zero",
+                    help="score_zero: an illegal case scores 0 and the batch "
+                         "continues (what the contest would award). zero_fill: "
+                         "abandon the trial at the first illegal case (legacy, "
+                         "fast but it hides how broad the illegality is)")
+    ap.add_argument("--canary_penalty", type=float, default=500.0,
+                    help="objective points subtracted when ALL canaries are "
+                         "illegal, pro-rated by the fraction that are")
+    ap.add_argument("--profile_mix", choices=tuple(Generator.PROFILE_MIX),
+                    default="balanced",
+                    help="case-profile weighting; 'uniform' restores the old "
+                         "equal round-robin over all 7 profiles")
     ap.add_argument("--no_probe", action="store_true",
                     help="skip probe calibration (faster, less gradient)")
     ap.add_argument("--baseline_only", action="store_true",
                     help="just score the default knobs and exit")
     ap.add_argument("--eval_env", help="score a saved .env file and exit")
     ap.add_argument("--no_prune", action="store_true")
+    ap.add_argument("--prune_warmup", type=int, default=0,
+                    help="cases to score before pruning may kick in "
+                         "(0 = canaries + 8, which is what you want)")
+    ap.add_argument("--seed_env", help="enqueue this .env as the first trial of a "
+                                       "fresh study (warm-start a refinement stage)")
+    if stage_args.stage:
+        ap.set_defaults(**STAGES[stage_args.stage])   # explicit flags still win
     a = ap.parse_args()
+    if a.stage:
+        print(f"[stage] preset {a.stage}: "
+              + " ".join(f"--{k} {v}" for k, v in STAGES[a.stage].items()))
+        if a.stage == 3 and not a.eval_env:
+            raise SystemExit("--stage 3 is selection-only; pass --eval_env FILE.env")
 
     if not os.path.exists(a.binary):
         print(f"error: {a.binary} not found -- compile it first:\n"
@@ -377,9 +465,11 @@ def main() -> None:
     for s in stale:
         print(f"[warn] knob registry: {s}")
 
-    cases, train_idx, reservoir_idx, val_idx = build_pools(a)
+    cases, canary_idx, train_idx, reservoir_idx, val_idx = build_pools(a)
     ev = Evaluator(cases, a.n_jobs, a.timeout_s, a.binary)
     try:
+        report(_sel(cases, canary_idx), ev.run_all(canary_idx, Knobs.DEFAULTS),
+               "baseline canaries (legality gate, not in objective)")
         base_train = report(_sel(cases, train_idx),
                             ev.run_all(train_idx, Knobs.DEFAULTS), "baseline train")
         base_val = report(_sel(cases, val_idx),
@@ -410,17 +500,31 @@ def main() -> None:
             return
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
+        # Reported steps are main-batch cases only now (the canaries run first
+        # and are scored separately), and Generator interleaves profiles so any
+        # prefix is representative -- so a plain case count is the right warmup.
+        warmup_steps = a.prune_warmup if a.prune_warmup > 0 else \
+            PRUNER_EXTRA_WARMUP_CASES
+        print(f"[prune] median pruner starts after {warmup_steps} main-batch cases")
         study = optuna.create_study(
             study_name=a.study_name, storage=a.storage, load_if_exists=True,
             direction="maximize",
             sampler=optuna.samplers.TPESampler(seed=a.seed, multivariate=True),
             pruner=(optuna.pruners.NopPruner() if a.no_prune else
                     optuna.pruners.MedianPruner(n_startup_trials=PRUNER_WARMUP_TRIALS,
-                                                n_warmup_steps=PRUNER_STARTUP_CASES)))
-        if not study.trials:                      # seed the defaults, once
+                                                n_warmup_steps=warmup_steps)))
+        if not study.trials:                      # seed known-good points, once
             study.enqueue_trial(dict(Knobs.DEFAULTS))
+            if a.seed_env:
+                warm = Knobs.clamp(Knobs.read_env_file(a.seed_env))
+                if len(warm) == len(Knobs.KNOBS):
+                    study.enqueue_trial(warm)
+                    print(f"[pool] warm-starting from {a.seed_env}")
+                else:
+                    print(f"[warn] {a.seed_env} covers {len(warm)}/{len(Knobs.KNOBS)} "
+                          "knobs -- not warm-starting")
 
-        obj = Objective(ev, train_idx, reservoir_idx, a)
+        obj = Objective(ev, canary_idx, train_idx, reservoir_idx, a)
         best_seen = -1.0
 
         def cb(st: "optuna.Study", tr: "optuna.trial.FrozenTrial") -> None:
@@ -464,6 +568,14 @@ def main() -> None:
         print(f"[result] train-minus-val gap {val_train - best_val:+.2f} "
               f"(large gap = overfitting to the generator)")
         print(f"[result] {obj.n_violations} illegal-output case runs during tuning")
+        if obj.canary_fragility:
+            print("[result] canary fragility (illegal at some knob values) -- "
+                  "these are edge cases the policy can break, not harness bugs:")
+            for prof, cnt in sorted(obj.canary_fragility.items(),
+                                    key=lambda kv: -kv[1]):
+                print(f"    {prof:<20} illegal in {cnt} trials")
+        else:
+            print("[result] no canary ever went illegal")
 
         show_importance(study)
 
