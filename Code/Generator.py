@@ -35,21 +35,18 @@ from typing import Any, Sequence
 
 import Simulator
 
+# ADDED: prefill_only, linear_scaling, and flash_crowd profiles
 PROFILES = ("latency_stress", "throughput_stress", "mixed_load", "large_R",
-            "small_K", "deep", "shallow")
+            "small_K", "deep", "shallow", "prefill_only", "linear_scaling", "flash_crowd")
 ALL_PROFILES = PROFILES + ("mixed",)
 
-# Round-robining the 7 profiles gives each a 1/7 share of the objective, which
-# hands 29% of the weight to the four *corner* profiles (both stress corners
-# plus the two degenerate-mechanic ones). The statement says degenerate values
-# "occur", not that they are a seventh of the set each, so uniform weighting
-# almost certainly over-weights corners relative to a real 20-test set.
-# PROFILE_MIX["balanced"] is an explicit guess at a finals-like shape; it is a
-# judgement call, and --profile_mix uniform reverts to the old behaviour.
+# Round-robining the profiles gives each a share of the objective.
+# PROFILE_MIX["balanced"] is an explicit guess at a finals-like shape.
 PROFILE_MIX: dict[str, dict[str, int]] = {
     "uniform": {p: 1 for p in PROFILES},
     "balanced": {"mixed_load": 5, "large_R": 3, "deep": 3, "latency_stress": 3,
-                 "throughput_stress": 3, "small_K": 2, "shallow": 1},
+                 "throughput_stress": 3, "small_K": 2, "shallow": 1,
+                 "prefill_only": 2, "linear_scaling": 2, "flash_crowd": 2},
 }
 
 
@@ -135,17 +132,23 @@ def _sys_params(rng: random.Random, profile: str) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------- time table ----
-def _table(rng: random.Random, S: float, layers: int) -> dict[str, Any]:
+def _table(rng: random.Random, S: float, layers: int, profile: str) -> dict[str, Any]:
     """Task-Time Table: N>=2 distinct batch sizes, >=1 non-missing cell per
-    column, sub-linear (possibly non-monotonic) decode scaling so that batching
-    is genuinely profitable, monotonic prefill."""
+    column. Handles sub-linear (genuinely profitable batching) and linear_scaling
+    (penalized batching)."""
     n = rng.choice([2, 3, 4, 6, 8, 12, 16, 24, 32, 64])
     caps = sorted(rng.sample(range(1, MAX_LIN + 1), n))
     if rng.random() < 0.5:                      # often list group size 1
         caps[0] = 1
     a_pre, a_proc, a_post = (10 ** rng.uniform(-2, 0.5) for _ in range(3))
-    exp = rng.uniform(0.45, 0.95)               # sub-linear in batch size
-    dexp = exp * rng.uniform(0.55, 0.85)        # decode scales even better
+
+    # PATCH: If linear scaling profile, make batching scale linearly or super-linearly
+    if profile == "linear_scaling":
+        exp = rng.uniform(1.0, 1.1)
+        dexp = rng.uniform(1.0, 1.1)
+    else:
+        exp = rng.uniform(0.45, 0.95)               # sub-linear in batch size
+        dexp = exp * rng.uniform(0.55, 0.85)        # decode scales even better
 
     rows: list[list[float]] = []
     for b in caps:
@@ -180,15 +183,8 @@ def _table(rng: random.Random, S: float, layers: int) -> dict[str, Any]:
 # --------------------------------------------------------------- requests ----
 def _requests(rng: random.Random, profile: str, token_budget: int, max_R: int,
               tbl: Simulator.Table, S: float) -> list[dict[str, Any]]:
-    """Arrival stream: nondecreasing timestamps, hidden L_out, sum(L_out) capped.
-
-    The arrival *rate* is set as a load factor times an estimate of the local
-    computer's service rate, rather than drawn blind. A blind rate makes most
-    cases wildly underloaded, and an underloaded case is dead weight for
-    tuning: its throughput is pinned by the arrival spread, so no knob can move
-    the score. Loaded cases are the ones where scheduling decisions matter.
-    """
-    if profile == "large_R":
+    """Arrival stream: nondecreasing timestamps, hidden L_out, sum(L_out) capped."""
+    if profile == "large_R" or profile == "flash_crowd":
         R = rng.randint(min(400, max_R), max_R)   # max_R may be below 400
     else:
         choices = [c for c in (1, 2, 5, 20, 60, 150, 400, 900) if c <= max_R]
@@ -202,39 +198,52 @@ def _requests(rng: random.Random, profile: str, token_budget: int, max_R: int,
         if budget <= 0:
             break
         L_in = max(1, min(MAX_LIN, int(10 ** rng.uniform(0, 3.6))))
-        L_out = max(1, min(lout_cap,
-                           int(10 ** rng.uniform(0, math.log10(lout_cap) + 0.3))))
+
+        # PATCH: If prefill_only, force L_out to 1 for all requests
+        if profile == "prefill_only":
+            L_out = 1
+        else:
+            L_out = max(1, min(lout_cap,
+                               int(10 ** rng.uniform(0, math.log10(lout_cap) + 0.3))))
+
         L_out = min(L_out, budget)
         budget -= L_out
         lens.append((L_in, L_out))
+
     if not lens:
         lens = [(1, 1)]
 
-    # Local-computer service rate: it runs every prefill PRE/POST and one
-    # D PRE/D POST per output wave, and unlike the remotes it cannot be scaled
-    # out, so it sets the sustainable request rate.
+    # Local-computer service rate
     mean_lin = sum(a for a, _ in lens) / len(lens)
     mean_lout = sum(b for _, b in lens) / len(lens)
-    g = 8.0                                     # nominal output group size
+    g = 8.0
     per_req = (2.0 * S + tbl.at(Simulator.C_PRE_PRE, mean_lin)
                + tbl.at(Simulator.C_PRE_POST, mean_lin)
                + mean_lout * (2.0 * S + tbl.at(Simulator.C_DEC_PRE, g)
                               + tbl.at(Simulator.C_DEC_POST, g)) / g)
-    mu = 1.0 / max(per_req, 1e-9)               # requests per ms
+    mu = 1.0 / max(per_req, 1e-9)
 
     if profile == "throughput_stress":
-        load = _loguniform(rng, 1.5, 12.0)      # deliberately overloaded
+        load = _loguniform(rng, 1.5, 12.0)
     elif profile == "latency_stress":
         load = _loguniform(rng, 0.4, 3.0)
     else:
         load = _loguniform(rng, 0.5, 8.0)
+
     rate = max(mu * load, 1e-12)
-    pattern = rng.choice(("poisson", "bursty", "uniform"))
+
+    # PATCH: Force flash crowd pattern
+    if profile == "flash_crowd":
+        pattern = "flash"
+    else:
+        pattern = rng.choice(("poisson", "bursty", "uniform"))
 
     t = 0.0
     out: list[dict[str, Any]] = []
     for L_in, L_out in lens:
-        if pattern == "poisson":
+        if pattern == "flash":
+            t = 0.0
+        elif pattern == "poisson":
             t += rng.expovariate(rate)
         elif pattern == "uniform":
             t += 1.0 / rate
@@ -246,36 +255,8 @@ def _requests(rng: random.Random, profile: str, token_budget: int, max_R: int,
 
 
 # -------------------------------------------------------------- calibration --
-# How the scoring line is calibrated, and why it is shaped this way.
-#
-# Solving the judge's own report (Judgement Protocol) for the hidden constants
-# shows exactly what its tests look like:
-#   * dist_base is 1.1x-11000x the *achieved* dist (median ~6.6x), so norm_c
-#     sits high but interior -- the reference scheduler is far worse than a real
-#     one, it is not a tie.
-#   * dist is driven by the TDR term: solving test #22 gives SLO1 ~ 7.5ms
-#     against mean_tdr 2782, while mean_tpot 8.0 contributes no excess at all.
-#     Test #12 gives SLO1 ~ 2.5e5 against mean_tdr 1.25e6 with dist_base 4.49,
-#     i.e. that scheduler was only 8% better than the reference -> norm_c 0.097.
-#
-# So SLO1 is *tight* relative to the reference's own TDR and SLO2 is *loose*
-# relative to an achievable concurrent TPOT. In that regime
-#
-#     norm_c ~ 1 - (scheduler TDR excess) / (reference TDR excess)
-#
-# which is scale free and is exactly "how much better than the reference are
-# you" -- a dense gradient for the tuner. Anchoring SLO2 to the *reference's*
-# TPOT instead would peg norm_c at 0 for every setting, because the sequential
-# reference gives one request the whole machine and no concurrent scheduler can
-# match its token spacing. That was the single biggest scoring bug in the first
-# draft of this kit.
-#
-# tp_base and dist_base themselves stay exactly what the statement defines them
-# to be: quantities of the one-request-at-a-time reference schedule.
-
 def _draw_calibration(rng: random.Random, profile: str) -> dict[str, Any]:
-    """All random choices of the scoring line, drawn once and stored, so the
-    probe stage can be re-run (or parallelised) without changing the case."""
+    """All random choices of the scoring line, drawn once and stored."""
     r = rng.random()
     if profile == "throughput_stress" or r < 0.25:
         w_tp = rng.uniform(0.85, 1.0)
@@ -283,7 +264,7 @@ def _draw_calibration(rng: random.Random, profile: str) -> dict[str, Any]:
         w_tp = rng.uniform(0.0, 0.15)
     else:
         w_tp = rng.uniform(0.2, 0.8)
-    if rng.random() < 0.06:                     # "Either weight may be 0"
+    if rng.random() < 0.06:
         w_tp = 0.0 if rng.random() < 0.5 else 1.0
 
     if profile == "latency_stress":
@@ -295,43 +276,26 @@ def _draw_calibration(rng: random.Random, profile: str) -> dict[str, Any]:
 
     return dict(
         w_tp=q9(_clamp(w_tp, 0.0, 1.0)),
-        # SLO1 = f1 * (reference TDR): usually far tighter than the reference.
         f1=_loguniform(rng, f1lo, f1hi),
-        # SLO2 = f2 * (achievable concurrent TPOT): usually loose.
         f2=_loguniform(rng, 0.8, 8.0),
-        # tp_UB is chosen so that the *measured* achievable throughput lands at
-        # norm_tp == q. Pinning the operating point on the [0,1] axis guarantees
-        # an interior gradient; a blind multiplier only hopes for one.
         q=rng.uniform(0.15, 0.6) if profile == "throughput_stress"
         else rng.uniform(0.25, 0.95),
-        m=_loguniform(rng, 0.8, 4.0),           # used only without a probe
-        # dist_base == 0 branch: both targets above the reference's own numbers.
+        m=_loguniform(rng, 0.8, 4.0),
         generous=rng.random() < 0.15,
         g1=_loguniform(rng, 1.05, 8.0),
         g2=_loguniform(rng, 1.5, 20.0),
-        # an SLO so large it cannot be violated in practice
         free1=rng.random() < 0.05,
         free2=rng.random() < 0.05,
     )
 
 
 def _fallback_scales(case: dict, ref: dict, ideal: float) -> dict[str, float]:
-    """Achievable-concurrency estimate used when no scheduler binary is probed.
-
-    A pipelined scheduler keeps roughly P requests in flight, which stretches
-    each request's token spacing by about P relative to the sequential
-    reference and lifts throughput toward the work-conservation bound. Crude,
-    but the right order of magnitude and monotone in the right direction; the
-    --probe path measures these instead.
-    """
     P = max(2.0, min(float(len(case["requests"])), 4.0 * case["K"]))
     return dict(tpot=max(ref["step"] * P, 1e-9), tp=max(ideal * 0.5, ref["tp"]))
 
 
 def probe_scales(case: dict, binary: str = "./scheduler",
                  timeout_s: float = 120.0) -> dict[str, float] | None:
-    """Measure the achievable TPOT/throughput scale by running the scheduler at
-    its default knobs against the provisional scoring line."""
     res = Simulator.run_one(case, {}, timeout_s=timeout_s, binary=binary)
     if not res.ok or res.tp <= 0.0:
         return None
@@ -342,7 +306,6 @@ def probe_scales(case: dict, binary: str = "./scheduler",
 
 
 def apply_calibration(case: dict, scales: dict[str, float]) -> dict:
-    """Write the scoring line from the reference schedule + achievable scales."""
     cal = case["_cal"]
     ref = Simulator.reference_schedule(case)
     ideal = Simulator.ideal_throughput(case)
@@ -350,14 +313,10 @@ def apply_calibration(case: dict, scales: dict[str, float]) -> dict:
     w_tp = cal["w_tp"]
     w_c = q9(1.0 - w_tp)
 
-    # With one or two requests there is nothing to overlap, so any scheduler
-    # reproduces the reference schedule and a tight target would score a
-    # constant 0 for every knob setting. The judge's own single-request test #1
-    # uses dist_base == 0 with satisfiable targets; match that.
     generous = cal["generous"] or len(case["requests"]) <= 2
     if generous:
-        SLO1 = ref["tdr"] * cal["g1"]           # above the reference's own TDR
-        SLO2 = scales["tpot"] * cal["g2"]       # and above its token spacing
+        SLO1 = ref["tdr"] * cal["g1"]
+        SLO2 = scales["tpot"] * cal["g2"]
     else:
         SLO1 = ref["tdr"] * cal["f1"]
         SLO2 = scales["tpot"] * cal["f2"]
@@ -371,15 +330,10 @@ def apply_calibration(case: dict, scales: dict[str, float]) -> dict:
     ex_tdr = max(0.0, (ref["tdr"] - SLO1) / SLO1)
     ex_tpot = max(0.0, (ref["tpot"] - SLO2) / SLO2)
     dist_base = _clamp(math.sqrt(ex_tdr ** 2 + ex_tpot ** 2), 0.0, 1e9)
-    if dist_base < 1e-6:                        # exercise the all-or-nothing branch
+    if dist_base < 1e-6:
         dist_base = 0.0
 
     if dist_base == 0.0:
-        # All-or-nothing: the waiting component is 1 only at dist == 0, so the
-        # targets have to be *satisfiable* or the case is a guaranteed zero that
-        # no knob setting can move. A request's own consecutive tokens each need
-        # a full PRE -> UP -> PROC -> DOWN -> POST round trip, so ref["step"] is
-        # a hard floor on any achievable TPOT.
         SLO2 = max(SLO2, max(ref["step"], scales["tpot"]) * cal["g2"])
         SLO2 = _clamp(SLO2, SLO_LO, SLO_HI)
         SLO1 = max(SLO1, ref["tdr"] * 1.05)
@@ -387,7 +341,6 @@ def apply_calibration(case: dict, scales: dict[str, float]) -> dict:
 
     tp_base = max(0.0, ref["tp"])
     if scales.get("probed") and scales["tp"] > tp_base:
-        # Place the measured rate at norm_tp == q:  q = (tp - base)/(UB - base).
         tp_UB = tp_base + (scales["tp"] - tp_base) / cal["q"]
     else:
         tp_UB = max(scales["tp"] * cal["m"], tp_base * 1.05)
@@ -395,7 +348,7 @@ def apply_calibration(case: dict, scales: dict[str, float]) -> dict:
 
     case.update(SLO1=q9(SLO1), SLO2=q9(SLO2), tp_UB=q9(tp_UB), tp_base=q9(tp_base),
                 dist_base=q9(dist_base), w_tp=w_tp, w_c=w_c)
-    if case["tp_UB"] <= case["tp_base"]:        # must survive 9-decimal rounding
+    if case["tp_UB"] <= case["tp_base"]:
         case["tp_UB"] = q9(case["tp_base"] + max(1e-9, 0.05 * case["tp_base"]))
     case["SLO1"] = _clamp(case["SLO1"], SLO_LO, SLO_HI)
     case["SLO2"] = _clamp(case["SLO2"], SLO_LO, SLO_HI)
@@ -409,15 +362,6 @@ def apply_calibration(case: dict, scales: dict[str, float]) -> dict:
 
 def calibrate(case: dict, probe: bool = False, binary: str = "./scheduler",
               timeout_s: float = 120.0, rounds: int = 2) -> dict:
-    """(Re)write the scoring line, optionally anchored on measured probe runs.
-
-    The scheduler reads SLO1/SLO2/w_tp and changes strategy accordingly, so the
-    probe and the final scoring line are mildly circular: a first probe against
-    a provisional line can land at a different operating point than the final
-    one. Two rounds settle that; each measured scale is also floored at the
-    physical single-request round trip so one freak probe cannot produce an
-    unsatisfiable target.
-    """
     ref = Simulator.reference_schedule(case)
     ideal = Simulator.ideal_throughput(case)
     scales = _fallback_scales(case, ref, ideal)
@@ -437,11 +381,6 @@ def calibrate(case: dict, probe: bool = False, binary: str = "./scheduler",
 # ------------------------------------------------------------------ assembly --
 def make_case(rng: random.Random, profile: str, token_budget: int = TOKEN_BUDGET,
               max_R: int = MAX_R, force: dict[str, Any] | None = None) -> dict:
-    """One constraint-checked case with a provisional (probe-free) scoring line.
-
-    Call `calibrate(case, probe=True)` -- or go through `generate(probe=True)`
-    -- to re-anchor the scoring line on a measured run.
-    """
     sysp = _sys_params(rng, profile)
     if force:
         sysp.update({k: v for k, v in force.items() if k in sysp})
@@ -449,14 +388,17 @@ def make_case(rng: random.Random, profile: str, token_budget: int = TOKEN_BUDGET
     case["S"] = q9(case["S"])
     case["latency_in_ms"] = max(0.001, q9(case["latency_in_ms"]))
     case["bandwidth_gbps"] = max(0.001, q9(case["bandwidth_gbps"]))
-    case["table"] = _table(rng, case["S"], case["num_layers"])
+
+    # PATCH: Pass profile to _table for correct scaling behavior
+    case["table"] = _table(rng, case["S"], case["num_layers"], profile)
+
     tbl = Simulator.Table(case["table"]["rows"])
     case["requests"] = force["requests"] if (force and "requests" in force) else \
         _requests(rng, profile, min(token_budget, TOKEN_BUDGET), min(max_R, MAX_R),
                   tbl, case["S"])
     case["_cal"] = _draw_calibration(rng, profile)
     calibrate(case, probe=False)
-    if force:                                   # explicit scoring-line overrides
+    if force:
         for k, v in force.items():
             if k != "requests" and k not in sysp:
                 case[k] = v
@@ -465,8 +407,6 @@ def make_case(rng: random.Random, profile: str, token_budget: int = TOKEN_BUDGET
 
 
 def check_case(case: dict) -> None:
-    """Assert every "Constraints" bullet -- a generator bug must never be
-    mistaken for a scheduler bug during tuning."""
     c = case
     assert 1 <= c["K"] <= 8, c["K"]
     assert 1.0 <= c["S"] <= 10.0, c["S"]
@@ -509,13 +449,6 @@ def generate(n_cases: int, seed: int, profile: str = "mixed",
              probe: bool = False, binary: str = "./scheduler",
              timeout_s: float = 120.0, workers: int = 1,
              probe_rounds: int = 2, mix: str = "balanced") -> list[dict]:
-    """Stratified batch. profile='mixed' round-robins all concrete profiles.
-
-    With probe=True the scoring line of every case is re-anchored on a measured
-    default-knob run of `binary` (see the calibration section). That costs one
-    scheduler run per case and is what makes the scores gradient-rich; it is
-    done once per pool, not once per trial.
-    """
     rng = random.Random(seed)
     seq = (profile_sequence(n_cases, mix) if profile == "mixed"
            else [profile] * n_cases)
@@ -526,7 +459,6 @@ def generate(n_cases: int, seed: int, profile: str = "mixed",
 
 def _probe_pool(cases: list[dict], binary: str, timeout_s: float,
                 workers: int, rounds: int = 2) -> list[dict]:
-    """Re-anchor a whole pool, optionally fanning the probe runs out."""
     if workers <= 1 or len(cases) <= 1:
         return [calibrate(c, True, binary, timeout_s, rounds) for c in cases]
     from concurrent.futures import ProcessPoolExecutor
@@ -538,18 +470,10 @@ def _probe_pool(cases: list[dict], binary: str, timeout_s: float,
 def edge_cases(seed: int = 1_234_567, token_budget: int = TOKEN_BUDGET,
                probe: bool = False, binary: str = "./scheduler",
                timeout_s: float = 120.0) -> list[dict]:
-    """Degenerate configurations kept in every training batch, so an illegal
-    knob setting surfaces immediately instead of being diluted by the mean.
-
-    Every mechanic the statement calls out as "simply disabled" gets a case:
-    K=1, num_layers=1, a single request, w_c=0 and w_tp=0, plus dist_base=0
-    (where the waiting component is all-or-nothing).
-    """
     rng = random.Random(seed)
     out: list[dict] = []
 
-    # Only the *weights* are forced; the scoring line stays calibrated, so a
-    # canary still carries gradient instead of contributing a constant.
+    # PATCH: Added the new profiles to the degenerate canary set
     specs: list[tuple[str, str, dict[str, Any], int]] = [
         ("edge_K1", "small_K", dict(K=1), MAX_R),
         ("edge_layers1", "shallow", dict(num_layers=1), MAX_R),
@@ -557,13 +481,16 @@ def edge_cases(seed: int = 1_234_567, token_budget: int = TOKEN_BUDGET,
         ("edge_tp_only", "mixed_load", dict(w_tp=1.0, w_c=0.0), MAX_R),
         ("edge_wait_only", "mixed_load", dict(w_tp=0.0, w_c=1.0), MAX_R),
         ("edge_deep", "deep", {}, MAX_R),
+        ("edge_prefill", "prefill_only", {}, MAX_R),
+        ("edge_linear", "linear_scaling", {}, MAX_R),
+        ("edge_flash", "flash_crowd", {}, MAX_R),
     ]
     for name, profile, force, max_R in specs:
         weights = {k: v for k, v in force.items() if k in ("w_tp", "w_c")}
         sysf = {k: v for k, v in force.items() if k not in ("w_tp", "w_c")}
         c = make_case(rng, profile, token_budget, max_R, sysf or None)
-        if weights:                             # weights drive scheduler strategy,
-            c["_cal"]["w_tp"] = weights["w_tp"]  # so set them before probing
+        if weights:
+            c["_cal"]["w_tp"] = weights["w_tp"]
             calibrate(c, probe=False)
         if probe:
             calibrate(c, True, binary, timeout_s)

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Single source of truth for the V4_* scheduler knobs and their search bounds.
 
 Defaults mirror ``loadKnobs()`` in scheduler.cpp exactly -- ``verify_against_cpp()``
