@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import math
 from statistics import mean
 import Generator
 import Simulator
@@ -9,21 +10,21 @@ import Simulator
 REAL_JUDGE_SCORES = {
     "Schedulers/schedulerA": 12040.376,
     "Schedulers/schedulerB": 833.636,
-    "Schedulers/schedulerC": 12019.115,
-    "Schedulers/schedulerD": 13416.759,
-    "Schedulers/schedulerF": 13416.759,
+    #"Schedulers/schedulerC": 12019.115,
+    #"Schedulers/schedulerD": 13416.759,
+    #"Schedulers/schedulerF": 13416.759,
     "Schedulers/schedulerG": 15574.578,
-    "Schedulers/schedulerH": 12873.409,
+    #"Schedulers/schedulerH": 12873.409,
     "Schedulers/schedulerI": 13932.366,
-    "Schedulers/schedulerJ": 14611.362,
+    #"Schedulers/schedulerJ": 14611.362,
     "Schedulers/schedulerK": 15570.559,
-    "Schedulers/schedulerL": 12959.146,
+    #"Schedulers/schedulerL": 12959.146,
     "Schedulers/schedulerM": 15844.316,
-    "Schedulers/schedulerN": 14735.223,
+    #"Schedulers/schedulerN": 14735.223,
     "Schedulers/schedulerO": 15659.345,
     "Schedulers/schedulerP": 14333.189,
     "Schedulers/schedulerQ": 15968.34,
-    "Schedulers/schedulerR": 12149.604,
+    #"Schedulers/schedulerR": 12149.604,
     "Schedulers/schedulerS": 15671.682,
     "Schedulers/schedulerT": 15960.639,
     "Schedulers/schedulerU": 15872.057,
@@ -34,9 +35,9 @@ REAL_JUDGE_SCORES = {
     "Schedulers/schedulerZ": 16040.685,
 }
 
-POOL_SIZE = 10000  # Total cases to generate for the search pool
-TARGET_SET_SIZE = 500  # How many cases you want in your final calibrated set
-TIMEOUT_S = 60.0  # Timeout per run
+POOL_SIZE = 10000
+TARGET_SET_SIZE = 400
+TIMEOUT_S = 60.0
 WORKERS = os.cpu_count() or 4
 CACHE_FILE = "score_matrix_cache.json"
 
@@ -44,18 +45,15 @@ CACHE_FILE = "score_matrix_cache.json"
 def main():
     global REAL_JUDGE_SCORES
 
-    # Windows OS safeguard: automatically append .exe so the subprocess doesn't throw a FileNotFoundError
     if os.name == 'nt':
         REAL_JUDGE_SCORES = {
             (k if k.endswith('.exe') else f"{k}.exe"): v
             for k, v in REAL_JUDGE_SCORES.items()
         }
 
-    # Sort versions by real judge score (descending)
     sorted_versions = sorted(REAL_JUDGE_SCORES.keys(), key=lambda v: REAL_JUDGE_SCORES[v], reverse=True)
 
     print(f"Generating massive pool of {POOL_SIZE} cases...")
-    # Generate cases using your Generator.py logic
     pool_cases = Generator.generate(
         n_cases=POOL_SIZE,
         seed=42,
@@ -65,17 +63,14 @@ def main():
         probe=False
     )
 
-    # Load existing cache if it exists
     score_matrix = {}
     if os.path.exists(CACHE_FILE):
         print(f"Found existing cache at '{CACHE_FILE}'. Loading previous results...")
         with open(CACHE_FILE, "r") as f:
             score_matrix = json.load(f)
 
-    # Evaluate all versions against all cases
     print("Evaluating all versions against the massive pool...")
     for binary in sorted_versions:
-        # Skip if we already have a complete run for this binary
         if binary in score_matrix and len(score_matrix[binary]) == POOL_SIZE:
             print(f"Skipping {binary}, full results found in cache.")
             continue
@@ -84,58 +79,98 @@ def main():
         results = Simulator.run_many(pool_cases, env_overrides={}, timeout_s=TIMEOUT_S, workers=WORKERS, binary=binary)
         score_matrix[binary] = [r.score for r in results]
 
-        # Save to disk immediately after the binary finishes evaluating
         with open(CACHE_FILE, "w") as f:
             json.dump(score_matrix, f)
         print(f"--> Saved progress for {binary} to cache.")
 
-    print("\nSearching for a rank-preserving subset...")
+    print("\nSearching for a rank-preserving subset using Simulated Annealing...")
 
-    # A simple greedy search to find a subset of cases that preserves the rank order
-    best_subset = []
-    best_violations = float('inf')
+    # Pre-calculate normalized real judge scores for accurate MSE spacing
+    real_scores = list(REAL_JUDGE_SCORES.values())
+    min_real, max_real = min(real_scores), max(real_scores)
+    norm_real = {k: (REAL_JUDGE_SCORES[k] - min_real) / (max_real - min_real + 1e-9) for k in sorted_versions}
 
-    # Try 5000 random subsets to find one that perfectly matches the real judge order
-    for iteration in range(5000):
-        candidate_idx = random.sample(range(POOL_SIZE), TARGET_SET_SIZE)
-
-        # Calculate mean scores for this subset
-        subset_means = {}
-        for binary in sorted_versions:
-            subset_scores = [score_matrix[binary][i] for i in candidate_idx]
-            subset_means[binary] = mean(subset_scores)
-
-        # Check how many ranking violations occur
+    def get_metrics(sums):
+        means = {b: sums[b] / TARGET_SET_SIZE for b in sorted_versions}
         violations = 0
         for i in range(len(sorted_versions) - 1):
-            v_better = sorted_versions[i]
-            v_worse = sorted_versions[i + 1]
-            if subset_means[v_better] <= subset_means[v_worse]:
-                violations += 1
+            for j in range(i + 1, len(sorted_versions)):
+                # Only check for violations if it is a strict inequality on the real judge
+                if REAL_JUDGE_SCORES[sorted_versions[i]] > REAL_JUDGE_SCORES[sorted_versions[j]]:
+                    if means[sorted_versions[i]] <= means[sorted_versions[j]]:
+                        violations += 1
 
-        if violations < best_violations:
-            best_violations = violations
-            best_subset = candidate_idx
+        min_sub, max_sub = min(means.values()), max(means.values())
+        mse = 0
+        for b in sorted_versions:
+            norm_sub = (means[b] - min_sub) / (max_sub - min_sub + 1e-9)
+            mse += (norm_real[b] - norm_sub) ** 2
 
-        if best_violations == 0:
-            print(f"Perfect subset found at iteration {iteration}!")
+        return violations, mse, means
+
+    best_subset = random.sample(range(POOL_SIZE), TARGET_SET_SIZE)
+    current_subset = set(best_subset)
+    remaining_pool = set(range(POOL_SIZE)) - current_subset
+
+    # Track sums dynamically for O(1) performance per iteration
+    current_sums = {b: sum(score_matrix[b][i] for i in current_subset) for b in sorted_versions}
+    current_violations, current_mse, _ = get_metrics(current_sums)
+
+    best_violations = current_violations
+    best_mse = current_mse
+    best_subset_final = list(current_subset)
+
+    T = 1.0
+    cooling_rate = 0.99995
+
+    # Run up to 200,000 iterations (takes <5 seconds due to O(1) updates)
+    for iteration in range(200000):
+        out_idx = random.choice(tuple(current_subset))
+        in_idx = random.choice(tuple(remaining_pool))
+
+        new_sums = {b: current_sums[b] + score_matrix[b][in_idx] - score_matrix[b][out_idx] for b in sorted_versions}
+        new_violations, new_mse, _ = get_metrics(new_sums)
+
+        # Heavily penalize ordinal violations, use MSE to fine-tune spacing
+        cost_diff = (new_violations - current_violations) + 5.0 * (new_mse - current_mse)
+
+        if cost_diff < 0 or math.exp(min(0, -cost_diff / T)) > random.random():
+            current_subset.remove(out_idx)
+            current_subset.add(in_idx)
+            remaining_pool.remove(in_idx)
+            remaining_pool.add(out_idx)
+
+            current_sums = new_sums
+            current_violations = new_violations
+            current_mse = new_mse
+
+            if (new_violations < best_violations) or (new_violations == best_violations and new_mse < best_mse):
+                best_violations = new_violations
+                best_mse = new_mse
+                best_subset_final = list(current_subset)
+
+        T *= cooling_rate
+        if iteration % 20000 == 0:
+            print(
+                f"Iter {iteration:6d} | Temp: {T:.4f} | Violations: {current_violations} (Best: {best_violations}) | MSE: {current_mse:.5f}")
+
+        if best_violations == 0 and best_mse < 0.005:
+            print(f"Perfect subset found early at iteration {iteration}!")
             break
 
-    # Output the results
-    print(f"\nFinal Subset Violations: {best_violations} (0 means perfect rank ordering)")
+    print(f"\nFinal Subset Violations: {best_violations}")
+
+    _, _, final_means = get_metrics({b: sum(score_matrix[b][i] for i in best_subset_final) for b in sorted_versions})
     print("Mean scores on this subset:")
     for binary in sorted_versions:
-        subset_scores = [score_matrix[binary][i] for i in best_subset]
-        print(f"{binary:<25} {mean(subset_scores):>8.2f} (Real Judge: {REAL_JUDGE_SCORES[binary]})")
+        print(f"{binary:<25} {final_means[binary]:>8.2f} (Real Judge: {REAL_JUDGE_SCORES[binary]})")
 
-    # Export the calibrated cases
-    final_cases = [pool_cases[i] for i in best_subset]
+    final_cases = [pool_cases[i] for i in best_subset_final]
     with open("calibrated_cases.jsonl", "w") as f:
         for c in final_cases:
             f.write(json.dumps(c) + "\n")
 
     print("\nSaved rank-preserving cases to 'calibrated_cases.jsonl'.")
-    print("Point Trainer.py to this file for accurate tuning!")
 
 
 if __name__ == "__main__":

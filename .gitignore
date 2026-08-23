@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+/Code/Schedulers/
+/Code/score_matrix_cache.json
+Code/best_hparams.json
+Code/best_hparams.env
+Code/Baseline.env
+Code/study.db
+Code/calibrated_cases.jsonl

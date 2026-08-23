@@ -352,9 +352,28 @@ def dump_best(params: dict[str, float | int], train_score: float, val_score: flo
 
 # --------------------------------------------------------------------- main ---
 def build_pools(a: argparse.Namespace) -> tuple[list[dict], list[int], list[int],
-                                              list[int], list[int]]:
-    """Generate every case up front (probing spawns its own workers, so this
-    must happen before the trial pool exists)."""
+list[int], list[int]]:
+    """Load cases from a calibrated file if available, otherwise generate them."""
+
+    calibrated_file = "calibrated_cases.jsonl"
+
+    # --- NEW LOGIC: Use calibrated file if it exists ---
+    if os.path.exists(calibrated_file):
+        print(f"[pool] Found '{calibrated_file}'. Loading calibrated cases...")
+        with open(calibrated_file, "r") as f:
+            cases = [json.loads(ln) for ln in f if ln.strip()]
+
+        n_can = 0
+        canary_idx = []
+        main_idx = list(range(len(cases)))
+        reservoir_idx = list(range(len(cases)))
+        val_idx = list(range(len(cases)))
+
+        a.n_canaries = n_can
+        print(f"[pool] Loaded {len(cases)} calibrated cases for tuning.")
+        return cases, canary_idx, main_idx, reservoir_idx, val_idx
+
+    # --- ORIGINAL LOGIC: Fallback to dynamic generation ---
     print(f"[pool] generating cases (token_budget={a.token_budget}, "
           f"probe={not a.no_probe}) ...")
     t0 = time.monotonic()
@@ -379,6 +398,7 @@ def build_pools(a: argparse.Namespace) -> tuple[list[dict], list[int], list[int]
     print(f"[pool] {len(cases)} cases ({n_can} canaries, legality gate only "
           f"+ {len(train)} train + {len(val)} val, profile_mix={a.profile_mix}) "
           f"in {time.monotonic() - t0:.1f}s")
+
     return cases, canary_idx, main_idx, reservoir_idx, val_idx
 
 
