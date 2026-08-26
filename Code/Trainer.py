@@ -1,614 +1,926 @@
-"""Part 3 -- knob tuner for the V4_* env knobs of scheduler.cpp.
-
-    python3 Trainer.py --n_trials 200            # tune
-    set -a; source best_hparams.env; set +a      # then use the result
-    ./scheduler                                  # real judge run
-
-CONCURRENCY MODEL
-  Optuna trials run SEQUENTIALLY; --n_jobs applies to the case batch inside each
-  trial. That avoids nested oversubscription between Optuna's own pool and the
-  simulator's. Cases are handed to the worker processes once, at pool startup,
-  and referenced by index afterwards -- a case with 2e5 tokens is megabytes and
-  re-pickling it per trial dominated the runtime otherwise.
-
-OBJECTIVE
-  Mean Score in [0, 1000] over a FIXED batch, matching the contest metric (the
-  arithmetic mean over the 20 frozen final tests). The batch is fixed on
-  purpose: the scheduler and the interactor are both deterministic, so a fixed
-  batch makes the objective deterministic and trial A directly comparable to
-  trial B. Resampling the batch every trial -- as an earlier version of this
-  script did -- turns knob effects into noise that the sampler cannot separate
-  from case-to-case variation, and TPE then models nothing.
-
-TRAIN / VALIDATION
-  * train set: --train_cases stratified cases, scored every trial. The
-    degenerate canaries run first as a LEGALITY GATE and are deliberately not
-    averaged into the objective -- the contest metric is an unweighted mean over
-    20 ordinary tests, and letting six edge cases carry a fifth of the weight
-    (which is what --train_cases 24 did) optimises for the wrong thing.
-    Rotation stays off by default: at --train_cases 200 the fixed batch is
-    already large enough that case-overfitting is weak, and the stationarity TPE
-    assumes is worth more -- more so now that the space is 40-dimensional.
-  * val set:   --val_cases cases generated once with a different seed and never
-    trained on, scored for the running best every --eval_every trials and again
-    at the end. Watch train-minus-val: that gap is overfitting to Generator
-    quirks, not a real improvement.
-
-ILLEGAL OUTPUT
-  A protocol violation scores 0 for that case and the rest of the batch is
-  filled with zeros, so the trial returns a real (very low) value instead of
-  being pruned. Pruning throws the information away; the sampler needs to learn
-  that the region is bad. Every violation is printed with its reason -- if one
-  shows up for the default knobs, that is a scheduler bug, not a tuning result.
 """
-from __future__ import annotations
+Trainer.py — High-Performance Optuna-Based Black-Box Optimizer for Scheduler Knobs.
+
+Searches the ~40 KnobSet parameters in Scheduler.h / Scheduler.cpp using the
+high-performance C++ Simulator engine as the ground-truth objective.
+
+Key Architecture & Anti-Stagnation Features:
+- Cyclic Multi-Phase Search Engine:
+    1. Multivariate TPE (joint modeling of coupled parameter groups, relative startup budget)
+    2. IPOP CMA-ES (increasing population local refinement with automatic restarts)
+    3. Multi-Scale Elite Mutation & Basin Jumps (fine, medium, coarse perturbations)
+    4. TPE Recycle & Re-anchoring across newly discovered basins
+- Relative & Scalable Hyperparameters: percentages of total trials rather than rigid constants
+- Gradient-Preserving Concave Fitness: power-mean formulation that raises profile floors
+  without killing gradients when bounded profiles (e.g. latency_only) score near zero
+- Non-Lossy Global Elite Candidate Pool: tracks top all-time candidates across the entire study
+- Dual Validation Trigger: immediate validation on all-time training records + periodic elite batch validation
+- Effective Validation Scoring: val_score * valid_ratio for robust promotion gating
+- Resumability: full state restoration from SQLite (study.db), champion.json, and champion.env
+- Automatic dataset sizing check: generates required testcases if fewer than requested
+- Rich Live Diagnostics: live progress reporting, phase indicators, and per-profile promotion breakdowns
+
+Usage:
+    python Code/Trainer.py [options]
+"""
 
 import argparse
-import atexit
-import json
+import collections
+import datetime
 import math
 import os
+from pathlib import Path
 import random
+import subprocess
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
-from statistics import mean
-from typing import Any, Sequence
+from typing import Any
 
-import Generator
-import Knobs
-import Simulator
+import optuna
+from optuna.samplers import TPESampler, CmaEsSampler
+import orjson
 
-PRUNER_WARMUP_TRIALS = 8
-PRUNER_EXTRA_WARMUP_CASES = 8
+import warnings
+warnings.filterwarnings("ignore")
 
-# ------------------------------------------------------- worker-side globals --
-_CASES: list[dict] = []
+# Silence verbose Optuna per-trial parameter dump logs
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-
-def _init_worker(cases: list[dict]) -> None:
-    global _CASES
-    _CASES = cases
-
-
-def _run_idx(idx: int, env: dict[str, Any], timeout_s: float,
-             binary: str) -> Simulator.SimResult:
-    return Simulator.run_one(_CASES[idx], env, timeout_s, binary)
+# Local imports
+from Generator import (
+    ALL_PROFILE_NAMES,
+    generate_dataset,
+    load_calibration_records,
+    generate_calibrated_dataset,
+    print_calibration_report,
+)
+from Simulator import ensure_binary
 
 
-# --------------------------------------------------------------- evaluation --
-class Evaluator:
-    """Owns the worker pool and evaluates (knobs, case-index list) -> scores."""
+# ============================ KNOB SPECIFICATIONS ============================
+# Default values from Scheduler.h KnobSet, with derived physical bounds.
 
-    def __init__(self, cases: list[dict], n_jobs: int, timeout_s: float,
-                 binary: str) -> None:
-        self.cases = cases
-        self.n_jobs = max(1, n_jobs)
-        self.timeout_s = timeout_s
-        self.binary = binary
-        self.ex: ProcessPoolExecutor | None = None
-        if self.n_jobs > 1:
-            self.ex = ProcessPoolExecutor(max_workers=self.n_jobs,
-                                          initializer=_init_worker,
-                                          initargs=(cases,))
-            atexit.register(self.close)
-        else:
-            _init_worker(cases)
+KNOB_SPECS: dict[str, dict[str, Any]] = {
+    # -- Discrete / Integer Knobs --
+    "SPT":              {"type": "int", "low": 0, "high": 1, "default": 1},
+    "CHUNK":            {"type": "int", "low": 0, "high": 1, "default": 1},
+    "HOLD":             {"type": "int", "low": -1, "high": 1, "default": 1},
+    "UPPRE_MAX":        {"type": "int", "low": 1, "high": 64, "default": 9},
+    "UPPRE_MAX_TP":     {"type": "int", "low": 1, "high": 64, "default": 13},
+    "WAVES_PROC":       {"type": "int", "low": 0, "high": 1, "default": 0},
+    "LATHOLD":          {"type": "int", "low": 0, "high": 1, "default": 0},
+    "CONS":             {"type": "int", "low": 0, "high": 1, "default": 1},
+    "AGE_NORM":         {"type": "int", "low": 0, "high": 1, "default": 0},
+    "CHUNK_PRED":       {"type": "int", "low": 0, "high": 1, "default": 0},
+    "HOLD_ACT":         {"type": "int", "low": 1, "high": 128, "default": 39},
+    "WAVE_CAPS_BATCH":  {"type": "int", "low": 0, "high": 1, "default": 0},
 
-    def close(self) -> None:
-        if self.ex is not None:
-            self.ex.shutdown(wait=False, cancel_futures=True)
-            self.ex = None
+    # -- Fractions / Ratios in [0, 1] --
+    "HOLD_WFRAC":       {"type": "float", "low": 0.0, "high": 1.0, "default": 0.311336180161816},
+    "UPGATE_FRAC":      {"type": "float", "low": 0.0, "high": 1.0, "default": 0.133183223107648},
+    "RATE_EFF":         {"type": "float", "low": 0.01, "high": 1.0, "default": 0.785281063030896},
+    "LATFRAC":          {"type": "float", "low": 0.0, "high": 1.0, "default": 0.784885482322511},
+    "HOLD_AW":          {"type": "float", "low": 0.0, "high": 1.0, "default": 0.691000184000935},
 
-    def chunks(self, idxs: Sequence[int]) -> list[list[int]]:
-        n = self.n_jobs
-        return [list(idxs[i:i + n]) for i in range(0, len(idxs), n)]
+    # -- Continuous Scaling / Weights (Wide Physical Intervals) --
+    "BASE_W":           {"type": "float", "low": 0.001, "high": 2500.0, "default": 0.0688174470439218, "log": True},
+    "AGE_SLO_W":        {"type": "float", "low": 0.01, "high": 100.0, "default": 20.5097192909652},
+    "CONS_PEN":         {"type": "float", "low": 0.01, "high": 5000.0, "default": 4.38521352191839, "log": True},
+    "CHUNK_SMULT":      {"type": "float", "low": 5.0, "high": 3000.0, "default": 117.072478194454},
+    "WAVES":            {"type": "float", "low": 0.5, "high": 150.0, "default": 2.6067767581806},
+    "HOLD_SMULT":       {"type": "float", "low": 0.1, "high": 400.0, "default": 35.7840349513665},
+    "DECW":             {"type": "float", "low": 0.05, "high": 100.0, "default": 1.56316454998452},
+    "CHUNK_MINS":       {"type": "float", "low": 2.0, "high": 1000.0, "default": 83.0861287103681},
+    "CHUNK_TPP":        {"type": "float", "low": 0.005, "high": 5.0, "default": 0.709332551776164},
+    "B_DPOST":          {"type": "float", "low": 0.0, "high": 100.0, "default": 4.77937996680665},
+    "B_PPOST":          {"type": "float", "low": 0.0, "high": 100.0, "default": 6.659109487552},
+    "B_DPRE":           {"type": "float", "low": 0.0, "high": 100.0, "default": 2.11491371566828},
+    "B_PPRE":           {"type": "float", "low": 0.0, "high": 100.0, "default": 3.59042054650082},
+    "B_DPROC":          {"type": "float", "low": 0.0, "high": 100.0, "default": 5.46600299914945},
+    "B_PPROC":          {"type": "float", "low": 0.0, "high": 100.0, "default": 0.210235165695655},
+    "AGE_FLOOR":        {"type": "float", "low": 0.0, "high": 50.0, "default": 0.345735897111258},
+    "AGE_AW":           {"type": "float", "low": 0.0, "high": 50.0, "default": 2.16669410499286},
+    "AGE_PRESS":        {"type": "float", "low": 0.0, "high": 30.0, "default": 3.24529577274236},
+    "DECQ":             {"type": "float", "low": 0.01, "high": 60.0, "default": 1.48621187428654},
+    "CHUNK_RATIO":      {"type": "float", "low": 0.001, "high": 100.0, "default": 7.06079186759801},
+    "LAT_MULT":         {"type": "float", "low": 0.1, "high": 50.0, "default": 7.54176800349664},
+    "GATE_TDR":         {"type": "float", "low": 0.01, "high": 10.0, "default": 1.27796897979818},
 
-    def run_chunk(self, idxs: Sequence[int],
-                  env: dict[str, Any]) -> list[Simulator.SimResult]:
-        if self.ex is None:
-            return [_run_idx(i, env, self.timeout_s, self.binary) for i in idxs]
-        futs = [self.ex.submit(_run_idx, i, env, self.timeout_s, self.binary)
-                for i in idxs]
-        return [f.result() for f in futs]
-
-    def run_all(self, idxs: Sequence[int],
-                env: dict[str, Any]) -> list[Simulator.SimResult]:
-        out: list[Simulator.SimResult] = []
-        for ch in self.chunks(idxs):
-            out.extend(self.run_chunk(ch, env))
-        return out
-
-
-def report(cases: Sequence[dict], results: Sequence[Simulator.SimResult],
-           label: str) -> float:
-    """Print a per-profile breakdown and return the mean score."""
-    by: dict[str, list[float]] = {}
-    bad: list[tuple[str, str]] = []
-    for c, r in zip(cases, results):
-        by.setdefault(c["profile"], []).append(r.score)
-        if not r.ok:
-            bad.append((c["profile"], r.violation or "?"))
-    total = mean([r.score for r in results]) if results else 0.0
-    print(f"\n[{label}] mean = {total:.2f} over {len(results)} cases")
-    for prof in sorted(by):
-        v = by[prof]
-        print(f"    {prof:<20} n={len(v):3d}  mean={mean(v):7.2f}  "
-              f"min={min(v):7.2f}  max={max(v):7.2f}")
-    for prof, why in bad[:10]:
-        print(f"    !! VIOLATION {prof}: {why}")
-    return total
-
-
-# ------------------------------------------------------------ search space ----
-def suggest(trial: Any) -> dict[str, float | int]:
-    """Search space straight from Knobs.KNOBS -- bounds live there, not here."""
-    v: dict[str, float | int] = {}
-    for k in Knobs.KNOBS:
-        if k.kind == "cat":
-            v[k.name] = trial.suggest_categorical(k.name, list(k.choices or ()))
-        elif k.kind == "int":
-            v[k.name] = trial.suggest_int(k.name, int(k.low), int(k.high))
-        elif k.kind == "logfloat":
-            v[k.name] = trial.suggest_float(k.name, float(k.low), float(k.high), log=True)
-        else:
-            v[k.name] = trial.suggest_float(k.name, float(k.low), float(k.high))
-    return v
-
-
-class Objective:
-    """Objective = unweighted mean Score over the *main* batch, minus a penalty
-    for any canary that came out illegal.
-
-    Two deliberate departures from the first version:
-
-    * The canaries no longer contribute score mass. They used to sit at the
-      front of the batch and be averaged in, so with the old --train_cases 24
-      the six degenerate cases carried 20% of the objective -- nothing like the
-      contest metric, which is an unweighted mean over 20 ordinary tests.
-    * A canary violation no longer zero-fills the whole trial. It costs
-      --canary_penalty * (fraction of canaries illegal), which keeps illegal
-      configurations firmly out of the running while still giving the sampler a
-      real, ordered value for the rest of the batch. One fragile edge case can
-      no longer make an otherwise-strong region look worthless.
-
-    A violation on a *main* case still scores that case 0, because that is
-    exactly what the contest would award for it.
-    """
-
-    def __init__(self, ev: Evaluator, canary_idx: list[int], main_idx: list[int],
-                 reservoir_idx: list[int], args: argparse.Namespace) -> None:
-        self.ev = ev
-        self.canary_idx = list(canary_idx)
-        self.main_idx = list(main_idx)
-        self.reservoir_idx = list(reservoir_idx)
-        self.a = args
-        self.n_violations = 0
-        self.canary_fragility: dict[str, int] = {}
-
-    def _batch(self, trial_number: int) -> list[int]:
-        if self.a.rotate_every <= 0 or not self.reservoir_idx:
-            return self.main_idx
-        rng = random.Random(trial_number // self.a.rotate_every)
-        k = min(len(self.main_idx), len(self.reservoir_idx))
-        return rng.sample(self.reservoir_idx, k)
-
-    def _run_canaries(self, trial: Any, env: dict[str, Any]) -> float:
-        """Return the objective penalty from illegal canaries (0 if all legal)."""
-        if not self.canary_idx:
-            return 0.0
-        bad: list[str] = []
-        for i, res in zip(self.canary_idx, self.ev.run_all(self.canary_idx, env)):
-            if not res.ok:
-                prof = self.ev.cases[i]["profile"]
-                bad.append(f"{prof}({res.violation})")
-                self.n_violations += 1
-                self.canary_fragility[prof] = self.canary_fragility.get(prof, 0) + 1
-        if not bad:
-            return 0.0
-        trial.set_user_attr("canary_violations", "; ".join(bad))
-        print(f"[canary] trial {trial.number}: {len(bad)}/{len(self.canary_idx)} "
-              f"illegal -> {'; '.join(bad)}")
-        return self.a.canary_penalty * len(bad) / len(self.canary_idx)
-
-    def __call__(self, trial: Any) -> float:
-        import optuna
-
-        env = suggest(trial)
-        penalty = self._run_canaries(trial, env)
-
-        idxs = self._batch(trial.number)
-        scores: list[float] = []
-        step = 0
-        for ch in self.ev.chunks(idxs):
-            for i, res in zip(ch, self.ev.run_chunk(ch, env)):
-                if not res.ok:
-                    self.n_violations += 1
-                    prof = self.ev.cases[i]["profile"]
-                    print(f"[violation] trial {trial.number} profile={prof} "
-                          f"reason={res.violation}")
-                    trial.set_user_attr("violation", f"{prof}: {res.violation}")
-                    scores.append(0.0)
-                    if self.a.violation_policy == "zero_fill":
-                        scores.extend([0.0] * (len(idxs) - len(scores)))
-                        return mean(scores) - penalty
-                else:
-                    scores.append(res.score)
-                trial.report(mean(scores) - penalty, step)
-                step += 1
-            if trial.should_prune():
-                raise optuna.TrialPruned()
-        return mean(scores) - penalty
-
-
-# ----------------------------------------------------- optuna-free fallback ---
-def fallback_search(ev: Evaluator, train_idx: list[int], n_trials: int,
-                    seed: int) -> tuple[dict[str, float | int], float]:
-    """Random search with local refinement, for environments without optuna."""
-    rng = random.Random(seed)
-
-    def sample(base: dict[str, float | int] | None, scale: float) -> dict[str, float | int]:
-        out: dict[str, float | int] = {}
-        for k in Knobs.KNOBS:
-            if base is None or rng.random() < scale:
-                if k.kind == "cat":
-                    out[k.name] = rng.choice(list(k.choices or ()))
-                elif k.kind == "int":
-                    out[k.name] = rng.randint(int(k.low), int(k.high))
-                elif k.kind == "logfloat":
-                    lo, hi = math.log(float(k.low)), math.log(float(k.high))
-                    out[k.name] = math.exp(rng.uniform(lo, hi))
-                else:
-                    out[k.name] = rng.uniform(float(k.low), float(k.high))
-            else:
-                out[k.name] = base[k.name]
-        return Knobs.clamp(out)
-
-    best = dict(Knobs.DEFAULTS)
-    best_score = mean([r.score for r in ev.run_all(train_idx, best)])
-    print(f"[fallback] defaults -> {best_score:.2f}")
-    for i in range(n_trials):
-        cand = sample(None if i < n_trials // 3 else best, 0.35)
-        sc = mean([r.score for r in ev.run_all(train_idx, cand)])
-        tag = ""
-        if sc > best_score:
-            best, best_score, tag = cand, sc, "  <-- new best"
-        print(f"[fallback] trial {i:4d} {sc:8.2f} (best {best_score:8.2f}){tag}")
-    return best, best_score
-
-
-def show_importance(study: Any) -> None:
-    """Rank the knobs by influence, degrading gracefully.
-
-    The default evaluator needs scikit-learn; PedANOVA does not. If neither is
-    usable (too few completed trials, missing numpy) fall back to a plain
-    rank-correlation over the completed trials, which needs nothing at all.
-    """
-    import warnings
-
-    import optuna
-
-    warnings.simplefilter("ignore", category=optuna.exceptions.ExperimentalWarning)
-    for label, kwargs in (("fANOVA/MDI", {}),
-                          ("PedANOVA", {"evaluator":
-                                        optuna.importance.PedAnovaImportanceEvaluator()})):
-        try:
-            imp = optuna.importance.get_param_importances(study, **kwargs)
-            print(f"\n[importance] most influential knobs ({label}):")
-            for k, v in list(imp.items())[:8]:
-                print(f"    {k:<18} {v:.3f}")
-            return
-        except Exception:
-            continue
-
-    done = [t for t in study.trials if t.value is not None and t.params]
-    if len(done) < 8:
-        print("[importance] unavailable (too few completed trials)")
-        return
-
-    def ranks(xs: list[float]) -> list[float]:
-        order = sorted(range(len(xs)), key=lambda i: xs[i])
-        r = [0.0] * len(xs)
-        for pos, i in enumerate(order):
-            r[i] = float(pos)
-        return r
-
-    ys = ranks([t.value for t in done])          # type: ignore[misc]
-    my = mean(ys)
-    dy = [y - my for y in ys]
-    var_y = sum(v * v for v in dy) ** 0.5
-    scored: list[tuple[float, str]] = []
-    for k in Knobs.KNOBS:
-        col = [float(t.params.get(k.name, k.default)) for t in done]
-        if len(set(col)) < 2:
-            continue
-        xs = ranks(col)
-        mx = mean(xs)
-        dx = [x - mx for x in xs]
-        var_x = sum(v * v for v in dx) ** 0.5
-        if var_x <= 0 or var_y <= 0:
-            continue
-        rho = sum(a * b for a, b in zip(dx, dy)) / (var_x * var_y)
-        scored.append((abs(rho), k.name))
-    scored.sort(reverse=True)
-    print("\n[importance] |rank correlation| with the score (fallback):")
-    for v, k in scored[:8]:
-        print(f"    {k:<18} {v:.3f}")
-
-
-# ------------------------------------------------------------------- output ---
-def dump_best(params: dict[str, float | int], train_score: float, val_score: float,
-              args: argparse.Namespace, extra: dict[str, Any] | None = None) -> None:
-    envmap = Knobs.write_env_file(params, args.env_out)
-    with open(args.json_out, "w") as f:
-        json.dump({"mean_train_score": train_score, "mean_val_score": val_score,
-                   "seed": args.seed, "train_cases": args.train_cases,
-                   "val_cases": args.val_cases, "token_budget": args.token_budget,
-                   "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                   "params": envmap, **(extra or {})}, f, indent=2)
-    print(f"\n[best] -> {args.env_out} and {args.json_out}")
-    print(Knobs.describe(params))
-
-
-# --------------------------------------------------------------------- main ---
-def build_pools(a: argparse.Namespace) -> tuple[list[dict], list[int], list[int],
-list[int], list[int]]:
-    """Load cases from a calibrated file if available, otherwise generate them."""
-
-    calibrated_file = "calibrated_cases.jsonl"
-
-    # --- NEW LOGIC: Use calibrated file if it exists ---
-    if os.path.exists(calibrated_file):
-        print(f"[pool] Found '{calibrated_file}'. Loading calibrated cases...")
-        with open(calibrated_file, "r") as f:
-            cases = [json.loads(ln) for ln in f if ln.strip()]
-
-        n_can = 0
-        canary_idx = []
-        main_idx = list(range(len(cases)))
-        reservoir_idx = list(range(len(cases)))
-        val_idx = list(range(len(cases)))
-
-        a.n_canaries = n_can
-        print(f"[pool] Loaded {len(cases)} calibrated cases for tuning.")
-        return cases, canary_idx, main_idx, reservoir_idx, val_idx
-
-    # --- ORIGINAL LOGIC: Fallback to dynamic generation ---
-    print(f"[pool] generating cases (token_budget={a.token_budget}, "
-          f"probe={not a.no_probe}) ...")
-    t0 = time.monotonic()
-    probe = not a.no_probe
-    canaries = Generator.edge_cases(a.seed + 7, a.token_budget, probe, a.binary,
-                                    a.timeout_s)
-    n_reservoir = max(a.pool_size, a.train_cases) if a.rotate_every > 0 else a.train_cases
-    train = Generator.generate(n_reservoir, a.seed, "mixed", a.token_budget,
-                               a.max_R, probe, a.binary, a.timeout_s, a.n_jobs,
-                               mix=a.profile_mix)
-    val = Generator.generate(a.val_cases, a.seed + 90_001, "mixed", a.token_budget,
-                             a.max_R, probe, a.binary, a.timeout_s, a.n_jobs,
-                             mix=a.profile_mix)
-
-    cases = canaries + train + val
-    n_can = len(canaries)
-    canary_idx = list(range(n_can))
-    main_idx = list(range(n_can, n_can + min(a.train_cases, len(train))))
-    reservoir_idx = list(range(n_can, n_can + len(train)))
-    val_idx = list(range(n_can + len(train), len(cases)))
-    a.n_canaries = n_can
-    print(f"[pool] {len(cases)} cases ({n_can} canaries, legality gate only "
-          f"+ {len(train)} train + {len(val)} val, profile_mix={a.profile_mix}) "
-          f"in {time.monotonic() - t0:.1f}s")
-
-    return cases, canary_idx, main_idx, reservoir_idx, val_idx
-
-
-STAGES: dict[int, dict[str, Any]] = {
-    # Stage 1 -- explore: many trials, moderate pool, cheap cases.
-    1: dict(n_trials=1500, train_cases=200, val_cases=200, token_budget=6000,
-            eval_every=100, timeout_s=600),
-    # Stage 2 -- refine: large pool for precision, warm-started from stage 1.
-    2: dict(n_trials=400, train_cases=2000, val_cases=400, token_budget=60000,
-            eval_every=50, timeout_s=900),
-    # Stage 3 -- select: no search, score saved configs at the real token limit.
-    3: dict(n_trials=0, train_cases=200, val_cases=400, token_budget=200000,
-            eval_every=0, timeout_s=1800),
+    # -- Soft-Cap Knobs (Log-Scale) --
+    "PPRE_AGECAP":      {"type": "float", "low": 1e3, "high": 1e14, "default": 58607547317.7586, "log": True},
 }
 
+DEFAULT_KNOBS: dict[str, Any] = {name: spec["default"] for name, spec in KNOB_SPECS.items()}
 
-def main() -> None:
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--stage", type=int, choices=(1, 2, 3))
-    stage_args, _ = pre.parse_known_args()
 
-    ap = argparse.ArgumentParser(description=__doc__, parents=[pre],
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--n_trials", type=int, default=1500)
-    ap.add_argument("--train_cases", type=int, default=200)
-    ap.add_argument("--val_cases", type=int, default=200)
-    ap.add_argument("--pool_size", type=int, default=200,
-                    help="rotation reservoir; only used when --rotate_every > 0")
-    ap.add_argument("--rotate_every", type=int, default=0,
-                    help="rotate the train batch every N trials (0 = fixed batch)")
-    ap.add_argument("--eval_every", type=int, default=100,
-                    help="validate the running best every N trials")
-    ap.add_argument("--token_budget", type=int, default=6000,  # noqa: E501
-                    help="cap on sum(L_out) per case; the real limit is 2e5, but "
-                         "smaller cases make a tuning run tractable")
-    ap.add_argument("--max_R", type=int, default=Generator.MAX_R)
-    ap.add_argument("--timeout_s", type=float, default=600.0)
-    ap.add_argument("--n_jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--binary", default="./scheduler")
-    ap.add_argument("--storage", default="sqlite:///study.db")
-    ap.add_argument("--study_name", default="v4_knobs")
-    ap.add_argument("--env_out", default="best_hparams.env")
-    ap.add_argument("--json_out", default="best_hparams.json")
-    ap.add_argument("--violation_policy", choices=("score_zero", "zero_fill"),
-                    default="score_zero",
-                    help="score_zero: an illegal case scores 0 and the batch "
-                         "continues (what the contest would award). zero_fill: "
-                         "abandon the trial at the first illegal case (legacy, "
-                         "fast but it hides how broad the illegality is)")
-    ap.add_argument("--canary_penalty", type=float, default=500.0,
-                    help="objective points subtracted when ALL canaries are "
-                         "illegal, pro-rated by the fraction that are")
-    ap.add_argument("--profile_mix", choices=tuple(Generator.PROFILE_MIX),
-                    default="balanced",
-                    help="case-profile weighting; 'uniform' restores the old "
-                         "equal round-robin over all 7 profiles")
-    ap.add_argument("--no_probe", action="store_true",
-                    help="skip probe calibration (faster, less gradient)")
-    ap.add_argument("--baseline_only", action="store_true",
-                    help="just score the default knobs and exit")
-    ap.add_argument("--eval_env", help="score a saved .env file and exit")
-    ap.add_argument("--no_prune", action="store_true")
-    ap.add_argument("--prune_warmup", type=int, default=0,
-                    help="cases to score before pruning may kick in "
-                         "(0 = canaries + 8, which is what you want)")
-    ap.add_argument("--seed_env", help="enqueue this .env as the first trial of a "
-                                       "fresh study (warm-start a refinement stage)")
-    if stage_args.stage:
-        ap.set_defaults(**STAGES[stage_args.stage])   # explicit flags still win
-    a = ap.parse_args()
-    if a.stage:
-        print(f"[stage] preset {a.stage}: "
-              + " ".join(f"--{k} {v}" for k, v in STAGES[a.stage].items()))
-        if a.stage == 3 and not a.eval_env:
-            raise SystemExit("--stage 3 is selection-only; pass --eval_env FILE.env")
-
-    if not os.path.exists(a.binary):
-        print(f"error: {a.binary} not found -- compile it first:\n"
-              f"    g++ -O2 -std=c++17 -o scheduler scheduler.cpp", file=sys.stderr)
-        raise SystemExit(2)
-    stale = Knobs.verify_against_cpp("scheduler.cpp", strict=False) \
-        if os.path.exists("scheduler.cpp") else []
-    for s in stale:
-        print(f"[warn] knob registry: {s}")
-
-    cases, canary_idx, train_idx, reservoir_idx, val_idx = build_pools(a)
-    ev = Evaluator(cases, a.n_jobs, a.timeout_s, a.binary)
-    try:
-        report(_sel(cases, canary_idx), ev.run_all(canary_idx, Knobs.DEFAULTS),
-               "baseline canaries (legality gate, not in objective)")
-        base_train = report(_sel(cases, train_idx),
-                            ev.run_all(train_idx, Knobs.DEFAULTS), "baseline train")
-        base_val = report(_sel(cases, val_idx),
-                          ev.run_all(val_idx, Knobs.DEFAULTS), "baseline val")
-        if a.baseline_only:
-            return
-        if a.eval_env:
-            params = Knobs.read_env_file(a.eval_env)
-            tr = report(_sel(cases, train_idx), ev.run_all(train_idx, params),
-                        f"{a.eval_env} train")
-            va = report(_sel(cases, val_idx), ev.run_all(val_idx, params),
-                        f"{a.eval_env} val")
-            print(f"\n[eval] train {tr:.2f} (baseline {base_train:.2f}, "
-                  f"{tr - base_train:+.2f})   val {va:.2f} "
-                  f"(baseline {base_val:.2f}, {va - base_val:+.2f})")
-            return
-
-        try:
-            import optuna
-        except ImportError:
-            print("[warn] optuna not installed -- using the built-in fallback search")
-            best, best_train = fallback_search(ev, train_idx, a.n_trials, a.seed)
-            best_val = report(_sel(cases, val_idx), ev.run_all(val_idx, best),
-                              "best val")
-            dump_best(best, best_train, best_val, a,
-                      {"baseline_train": base_train, "baseline_val": base_val,
-                       "sampler": "fallback"})
-            return
-
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        # Reported steps are main-batch cases only now (the canaries run first
-        # and are scored separately), and Generator interleaves profiles so any
-        # prefix is representative -- so a plain case count is the right warmup.
-        warmup_steps = a.prune_warmup if a.prune_warmup > 0 else \
-            PRUNER_EXTRA_WARMUP_CASES
-        print(f"[prune] median pruner starts after {warmup_steps} main-batch cases")
-        study = optuna.create_study(
-            study_name=a.study_name, storage=a.storage, load_if_exists=True,
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=a.seed, multivariate=True),
-            pruner=(optuna.pruners.NopPruner() if a.no_prune else
-                    optuna.pruners.MedianPruner(n_startup_trials=PRUNER_WARMUP_TRIALS,
-                                                n_warmup_steps=warmup_steps)))
-        if not study.trials:                      # seed known-good points, once
-            study.enqueue_trial(dict(Knobs.DEFAULTS))
-            if a.seed_env:
-                warm = Knobs.clamp(Knobs.read_env_file(a.seed_env))
-                if len(warm) == len(Knobs.KNOBS):
-                    study.enqueue_trial(warm)
-                    print(f"[pool] warm-starting from {a.seed_env}")
-                else:
-                    print(f"[warn] {a.seed_env} covers {len(warm)}/{len(Knobs.KNOBS)} "
-                          "knobs -- not warm-starting")
-
-        obj = Objective(ev, canary_idx, train_idx, reservoir_idx, a)
-        best_seen = -1.0
-
-        def cb(st: "optuna.Study", tr: "optuna.trial.FrozenTrial") -> None:
-            nonlocal best_seen
-            val = tr.value if tr.value is not None else float("nan")
-            done = len(st.trials)
-            mark = ""
-            try:
-                if st.best_value > best_seen:
-                    best_seen = st.best_value
-                    mark = "  <-- new best"
-            except ValueError:
-                pass
-            print(f"[trial {tr.number:4d}] {tr.state.name:9s} value={val:8.2f} "
-                  f"best={best_seen:8.2f}{mark}")
-            if a.eval_every > 0 and done % a.eval_every == 0:
-                try:
-                    params = st.best_params
-                except ValueError:
-                    return
-                v = mean([r.score for r in ev.run_all(val_idx, params)])
-                print(f"[trial {tr.number:4d}] val(best) = {v:.2f}   "
-                      f"train-minus-val = {st.best_value - v:+.2f}")
-
-        study.optimize(obj, n_trials=a.n_trials, n_jobs=1, callbacks=[cb],
-                       gc_after_trial=True)
-
-        if not [t for t in study.trials if t.value is not None]:
-            print("no trial completed -- nothing to dump")
-            return
-        best = study.best_trial
-        params = Knobs.clamp(best.params) or dict(Knobs.DEFAULTS)
-        print(f"\n[best] trial {best.number}: train {best.value:.2f}")
-        val_train = report(_sel(cases, train_idx), ev.run_all(train_idx, params),
-                           "best train (re-check)")
-        best_val = report(_sel(cases, val_idx), ev.run_all(val_idx, params), "best val")
-        print(f"\n[result] train {val_train:.2f} (baseline {base_train:.2f}, "
-              f"{val_train - base_train:+.2f})")
-        print(f"[result] val   {best_val:.2f} (baseline {base_val:.2f}, "
-              f"{best_val - base_val:+.2f})")
-        print(f"[result] train-minus-val gap {val_train - best_val:+.2f} "
-              f"(large gap = overfitting to the generator)")
-        print(f"[result] {obj.n_violations} illegal-output case runs during tuning")
-        if obj.canary_fragility:
-            print("[result] canary fragility (illegal at some knob values) -- "
-                  "these are edge cases the policy can break, not harness bugs:")
-            for prof, cnt in sorted(obj.canary_fragility.items(),
-                                    key=lambda kv: -kv[1]):
-                print(f"    {prof:<20} illegal in {cnt} trials")
+def suggest_knobs(trial: optuna.Trial) -> dict[str, Any]:
+    """Suggest all parameters in unified search space."""
+    params = {}
+    for name, spec in KNOB_SPECS.items():
+        if spec["type"] == "int":
+            params[name] = trial.suggest_int(name, spec["low"], spec["high"])
+        elif spec.get("log", False):
+            params[name] = trial.suggest_float(name, spec["low"], spec["high"], log=True)
         else:
-            print("[result] no canary ever went illegal")
-
-        show_importance(study)
-
-        dump_best(params, val_train, best_val, a,
-                  {"baseline_train": base_train, "baseline_val": base_val,
-                   "best_trial": best.number, "n_trials": len(study.trials),
-                   "sampler": "TPESampler"})
-    finally:
-        ev.close()
+            params[name] = trial.suggest_float(name, spec["low"], spec["high"])
+    return params
 
 
-def _sel(cases: Sequence[dict], idxs: Sequence[int]) -> list[dict]:
-    return [cases[i] for i in idxs]
+def mutate_knobs(
+    base_knobs: dict[str, Any],
+    scale: float = 0.10,
+    discrete_flip_prob: float = 0.15,
+    rng: random.Random | None = None,
+) -> dict[str, Any]:
+    """Generate a mutated neighbor of base_knobs with multi-scale noise."""
+    r = rng or random.Random()
+    mutated = {}
+
+    for name, spec in KNOB_SPECS.items():
+        cur_val = base_knobs.get(name, spec["default"])
+        low, high = spec["low"], spec["high"]
+
+        if spec["type"] == "int":
+            if r.random() < discrete_flip_prob:
+                if high - low <= 2:
+                    # Discrete flip
+                    mutated[name] = low if cur_val == high else high
+                else:
+                    # Integer shift or random choice
+                    shift = r.choice([-2, -1, 1, 2])
+                    mutated[name] = max(low, min(high, int(cur_val + shift)))
+            else:
+                mutated[name] = int(cur_val)
+        elif spec.get("log", False):
+            # Log-scale Gaussian perturbation
+            cur_log = math.log10(max(cur_val, low))
+            log_low, log_high = math.log10(low), math.log10(high)
+            new_log = cur_log + r.gauss(0.0, scale * (log_high - log_low))
+            mutated[name] = float(10.0 ** max(log_low, min(log_high, new_log)))
+        else:
+            # Multiplicative log-normal or additive Gaussian perturbation
+            if cur_val > 0 and low > 0 and high / low > 10.0:
+                # Wide range: multiplicative noise
+                mult = math.exp(r.gauss(0.0, scale))
+                new_val = cur_val * mult
+            else:
+                # Narrow / fraction range: bounded additive noise
+                span = high - low
+                new_val = cur_val + r.gauss(0.0, scale * span)
+            mutated[name] = float(max(low, min(high, new_val)))
+
+    return mutated
+
+
+def knobs_to_env(knobs: dict[str, Any]) -> dict[str, str]:
+    """Convert knob dict to V4_* environment variables."""
+    env = os.environ.copy()
+    for name, val in knobs.items():
+        env[f"V4_{name}"] = str(val)
+    return env
+
+
+def export_champion_env(knobs: dict[str, Any], filepath: Path) -> None:
+    """Export champion knobs to ready-to-source bash .env file."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("# Scheduler Champion Knobs -- Auto-generated by Trainer.py\n")
+        f.write(f"# Timestamp: {datetime.datetime.now().isoformat()}\n\n")
+        for name, val in sorted(knobs.items()):
+            f.write(f"export V4_{name}={val}\n")
+
+
+def export_champion_json(metadata: dict[str, Any], filepath: Path) -> None:
+    """Export champion metrics and metadata to JSON."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "wb") as f:
+        f.write(orjson.dumps(metadata, option=orjson.OPT_INDENT_2))
+
+
+def count_jsonl_lines(path: Path) -> int:
+    """Count non-empty lines in a JSONL file."""
+    if not path.exists():
+        return 0
+    count = 0
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
+
+
+# ============================ EVALUATION & FITNESS ============================
+
+def run_simulation_subprocess(
+    exe_path: Path,
+    dataset_path: Path,
+    knobs: dict[str, Any],
+    threads: int = 0,
+) -> dict[str, Any]:
+    """Invoke Simulator.exe in a subprocess with candidate environment."""
+    cmd = [str(exe_path), "--json", "-i", str(dataset_path)]
+    if threads > 0:
+        cmd.extend(["-t", str(threads)])
+
+    env = knobs_to_env(knobs)
+    res = subprocess.run(cmd, capture_output=True, env=env)
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"Simulator failed with return code {res.returncode}:\n{res.stderr.decode('utf-8', errors='replace')}"
+        )
+
+    return orjson.loads(res.stdout)
+
+
+def compute_fitness(
+    payload: dict[str, Any],
+    alpha: float = 0.7,
+    fitness_mode: str = "avg_only",
+    beta: float = 0.05,
+    power: float = 0.5,
+    lambda_invalid: float = 1.0,
+) -> tuple[float, float, float, dict[str, float]]:
+    """
+    Compute robust monotonic fitness from simulation results.
+
+    Modes:
+    - 'power_mean': Concave generalized power-mean raising profile floors while preserving
+      non-zero gradients across ALL profiles (immune to 0-score bounded profiles).
+    - 'avg_only': Direct arithmetic mean score with invalid penalty (exact contest target).
+    - 'soft_min': Legacy LogSumExp soft-min formulation.
+
+    Returns:
+        (fitness, avg_score, floor_metric, per_profile_averages)
+    """
+    results = payload.get("results", [])
+    total = payload.get("total_testcases", len(results))
+    valid_count = payload.get("valid_count", 0)
+    invalid_count = total - valid_count
+
+    if not results:
+        return -10000.0, 0.0, 0.0, {}
+
+    profile_scores: dict[str, list[float]] = collections.defaultdict(list)
+    all_scores: list[float] = []
+
+    for r in results:
+        score = float(r.get("score", 0.0)) if r.get("valid", False) else 0.0
+        pname = r.get("profile", "unknown")
+        profile_scores[pname].append(score)
+        all_scores.append(score)
+
+    avg_score = sum(all_scores) / max(len(all_scores), 1)
+
+    profile_means: dict[str, float] = {
+        pname: (sum(scores) / max(len(scores), 1))
+        for pname, scores in profile_scores.items()
+    }
+
+    floor_metric = 0.0
+    if profile_means:
+        p_vals = list(profile_means.values())
+        if fitness_mode == "power_mean":
+            # Generalized concave power mean: M_p(x) = (1/K * sum((p_i + 1)^p))^(1/p) - 1
+            # Provides strictly positive, smooth gradients for all profiles across [0, 1000]
+            mean_powered = sum((max(0.0, p) + 1.0) ** power for p in p_vals) / len(p_vals)
+            floor_metric = (mean_powered ** (1.0 / power)) - 1.0
+        elif fitness_mode == "soft_min":
+            # Legacy soft-min
+            m = min(p_vals)
+            floor_metric = m - math.log(sum(math.exp(-beta * (p - m)) for p in p_vals)) / beta
+        else:  # avg_only
+            floor_metric = avg_score
+    else:
+        floor_metric = avg_score
+
+    invalid_ratio = invalid_count / max(total, 1)
+    invalid_penalty = lambda_invalid * invalid_ratio * 1000.0
+
+    if fitness_mode == "avg_only":
+        fitness = avg_score - invalid_penalty
+    else:
+        fitness = alpha * avg_score + (1.0 - alpha) * floor_metric - invalid_penalty
+
+    return fitness, avg_score, floor_metric, profile_means
+
+
+# ============================ ELITE CANDIDATE POOL ============================
+
+class EliteCandidatePool:
+    """Non-lossy priority tracking of top-performing candidate knob sets."""
+
+    def __init__(self, capacity: int = 15):
+        self.capacity = max(5, capacity)
+        # List of dicts: {"fitness", "avg_score", "knobs", "trial_number", "val_score", "val_valid", "val_total", "validated"}
+        self.pool: list[dict[str, Any]] = []
+
+    def add(self, knobs: dict[str, Any], fitness: float, avg_score: float, trial_number: int) -> bool:
+        """Add candidate to elite pool if competitive."""
+        # Check for near-identical duplicate in pool
+        for item in self.pool:
+            if abs(item["fitness"] - fitness) < 1e-4:
+                return False
+
+        entry = {
+            "fitness": fitness,
+            "avg_score": avg_score,
+            "knobs": knobs.copy(),
+            "trial_number": trial_number,
+            "val_score": None,
+            "val_valid": None,
+            "val_total": None,
+            "validated": False,
+        }
+
+        self.pool.append(entry)
+        self.pool.sort(key=lambda x: x["fitness"], reverse=True)
+
+        if len(self.pool) > self.capacity:
+            self.pool = self.pool[:self.capacity]
+            # Returns True if candidate survived in pool
+            return any(x["trial_number"] == trial_number for x in self.pool)
+        return True
+
+    def get_unvalidated(self) -> list[dict[str, Any]]:
+        """Retrieve candidates that have not yet been evaluated on validation set."""
+        return [c for c in self.pool if not c["validated"]]
+
+    def mark_validated(self, trial_number: int, val_score: float, val_valid: int, val_total: int) -> None:
+        """Update candidate validation outcomes."""
+        for c in self.pool:
+            if c["trial_number"] == trial_number:
+                c["val_score"] = val_score
+                c["val_valid"] = val_valid
+                c["val_total"] = val_total
+                c["validated"] = True
+                break
+
+    def get_top(self, k: int = 5) -> list[dict[str, Any]]:
+        """Get top k elite candidates."""
+        return self.pool[:k]
+
+    def best_train_fitness(self) -> float:
+        """Return highest train fitness in pool."""
+        return self.pool[0]["fitness"] if self.pool else -1e9
+
+
+# ============================ TRAINER ORCHESTRATOR ============================
+
+class KnobTrainer:
+    def __init__(
+        self,
+        study_name: str = "scheduler_knobs",
+        storage: str = "sqlite:///study.db",
+        train_size: int = 16384,
+        val_size: int = 8192,
+        holdout_size: int = 8192,
+        threads: int = 0,
+        val_every: int = 10,
+        startup_ratio: float = 0.15,
+        stagnation_ratio: float = 0.06,
+        alpha: float = 0.70,
+        fitness_mode: str = "avg_only",
+        power: float = 0.50,
+        beta: float = 0.05,
+        lambda_invalid: float = 1.0,
+        seed: int = 42,
+        calibration_dir: Path | str | None = None,
+        enable_calibration: bool = True,
+        output_dir: Path | None = None,
+    ):
+        self.project_root = Path(__file__).resolve().parent.parent
+        self.output_dir = output_dir or (self.project_root / "Artifacts")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.train_dir = self.project_root / "Testcases" / "Train"
+        self.train_dir.mkdir(parents=True, exist_ok=True)
+
+        self.calibration_dir = Path(calibration_dir) if calibration_dir else (self.project_root / "Calibration")
+        self.enable_calibration = enable_calibration
+
+        self.train_path = self.train_dir / "train.jsonl"
+        self.val_path = self.train_dir / "val.jsonl"
+        self.holdout_path = self.train_dir / "holdout.jsonl"
+
+        self.study_name = study_name
+        self.storage = storage
+        self.train_size = train_size
+        self.val_size = val_size
+        self.holdout_size = holdout_size
+        self.threads = threads
+        self.val_every = val_every
+        self.startup_ratio = startup_ratio
+        self.stagnation_ratio = stagnation_ratio
+        self.alpha = alpha
+        self.fitness_mode = fitness_mode
+        self.power = power
+        self.beta = beta
+        self.lambda_invalid = lambda_invalid
+        self.seed = seed
+        self.rng = random.Random(seed)
+
+        # Champion state tracking
+        self.champion_val_score: float = -1.0
+        self.champion_effective_val: float = -1.0
+        self.champion_train_score: float = -1.0
+        self.champion_val_valid: int = 0
+        self.champion_val_total: int = 0
+        self.champion_knobs: dict[str, Any] = DEFAULT_KNOBS.copy()
+        self.champion_trial: int = -1
+        self.promotions_count: int = 0
+        self.last_promotion_trial: int = 0
+
+        # Optimization phase state machine
+        # Phases: 'TPE_GLOBAL' -> 'CMAES_REFINE' -> 'ELITE_MUTATE' -> 'TPE_RECYCLE'
+        self.current_phase: str = "TPE_GLOBAL"
+        self.phase_start_trial: int = 0
+        self.stagnation_window: int = 80
+        self.cmaes_restarts_count: int = 0
+
+        # Elite candidate pool
+        self.elite_pool = EliteCandidatePool(capacity=15)
+        self.all_time_best_train_fitness: float = -1e9
+
+        # Compile simulator binary if needed
+        self.exe_path = ensure_binary()
+
+    def ensure_datasets(self) -> None:
+        """Verify datasets exist and contain at least the requested number of testcases. Auto-calibrates against Calibration/ if records exist."""
+        train_count = count_jsonl_lines(self.train_path)
+        val_count = count_jsonl_lines(self.val_path)
+        holdout_count = count_jsonl_lines(self.holdout_path)
+
+        needs_gen = (train_count < self.train_size) or (val_count < self.val_size) or (holdout_count < self.holdout_size)
+
+        if not needs_gen:
+            print(f"[Dataset] Verified existing datasets: Train={train_count}, Val={val_count}, Holdout={holdout_count}")
+            return
+
+        # Ingest calibration records if enabled
+        cal_records = []
+        if self.enable_calibration and self.calibration_dir.exists():
+            cal_records = load_calibration_records(self.calibration_dir)
+
+        if cal_records:
+            print(f"\n[Dataset] Loaded {len(cal_records)} Real Judge calibration run(s) from {self.calibration_dir}:")
+            for idx, rec in enumerate(cal_records, start=1):
+                print(f"  [{idx}] {rec.name:<25} Real Score: {rec.real_score:.4f}")
+            print(f"[Dataset] Auto-calibration ENABLED: Enforcing zero-score filtering and suite rank monotonicity.\n")
+        else:
+            if self.enable_calibration:
+                print(f"[Dataset] No calibration files found in {self.calibration_dir}. Running standard generator.")
+
+        def _generate(count_needed: int, path: Path, seed: int, name: str) -> None:
+            if cal_records:
+                print(f"[Dataset] Generating {count_needed} CALIBRATED testcases for {name} -> {path}...")
+                prof_counts, sim_avgs, tau, rejections = generate_calibrated_dataset(
+                    num_testcases=count_needed,
+                    output_path=path,
+                    calibration_records=cal_records,
+                    simulator_exe=self.exe_path,
+                    seed=seed,
+                    threads=self.threads,
+                    verbose=False,
+                )
+                print_calibration_report(cal_records, sim_avgs, tau, count_needed, rejections)
+            else:
+                print(f"[Dataset] Generating {count_needed} testcases for {name} -> {path}...")
+                generate_dataset(count_needed, path, seed=seed)
+
+        if train_count < self.train_size:
+            print(f"[Dataset] Train set has {train_count} testcases (need {self.train_size}).")
+            _generate(self.train_size, self.train_path, self.seed, "Train")
+
+        if val_count < self.val_size:
+            print(f"[Dataset] Val set has {val_count} testcases (need {self.val_size}).")
+            _generate(self.val_size, self.val_path, self.seed + 1000, "Validation")
+
+        if holdout_count < self.holdout_size:
+            print(f"[Dataset] Holdout set has {holdout_count} testcases (need {self.holdout_size}).")
+            _generate(self.holdout_size, self.holdout_path, self.seed + 2000, "Holdout")
+
+    def evaluate_dataset(self, dataset_path: Path, knobs: dict[str, Any]) -> tuple[float, dict[str, float], int, int]:
+        """Evaluate a dataset and return (avg_score, profile_means, valid_count, total)."""
+        payload = run_simulation_subprocess(self.exe_path, dataset_path, knobs, threads=self.threads)
+        results = payload.get("results", [])
+        total = payload.get("total_testcases", len(results))
+        valid_cnt = payload.get("valid_count", 0)
+
+        profile_scores = collections.defaultdict(list)
+        all_scores = []
+        for r in results:
+            score = float(r.get("score", 0.0)) if r.get("valid", False) else 0.0
+            profile_scores[r.get("profile", "unknown")].append(score)
+            all_scores.append(score)
+
+        avg_score = sum(all_scores) / max(len(all_scores), 1)
+        profile_means = {p: (sum(s) / max(len(s), 1)) for p, s in profile_scores.items()}
+        return avg_score, profile_means, valid_cnt, total
+
+    def evaluate_and_promote_champion(self, candidate_knobs: dict[str, Any], trial_number: int, train_score: float) -> bool:
+        """Evaluate candidate on val.jsonl and promote if it improves effective validation score."""
+        val_score, val_profiles, val_valid, val_total = self.evaluate_dataset(self.val_path, candidate_knobs)
+
+        # Mark in elite pool
+        self.elite_pool.mark_validated(trial_number, val_score, val_valid, val_total)
+
+        effective_val = val_score * (val_valid / max(val_total, 1))
+        min_valid_req = min(self.champion_val_valid, int(val_total * 0.999)) if self.champion_val_valid > 0 else val_total
+
+        # Robust promotion gate: effective val score must exceed champion
+        is_promoted = (
+            (effective_val > self.champion_effective_val + 1e-4) and
+            (val_valid >= min_valid_req)
+        )
+
+        if is_promoted:
+            old_val = self.champion_val_score
+            old_eff = self.champion_effective_val
+            self.champion_val_score = val_score
+            self.champion_effective_val = effective_val
+            self.champion_train_score = train_score
+            self.champion_val_valid = val_valid
+            self.champion_val_total = val_total
+            self.champion_knobs = candidate_knobs.copy()
+            self.champion_trial = trial_number
+            self.promotions_count += 1
+            self.last_promotion_trial = trial_number
+
+            # Export champion artifacts
+            env_file = self.output_dir / "champion.env"
+            json_file = self.output_dir / "champion.json"
+            export_champion_env(candidate_knobs, env_file)
+
+            meta = {
+                "trial_id": trial_number,
+                "promoted_at": datetime.datetime.now().isoformat(),
+                "val_score": round(val_score, 4),
+                "effective_val_score": round(effective_val, 4),
+                "train_score": round(train_score, 4),
+                "val_valid_count": val_valid,
+                "val_total_testcases": val_total,
+                "val_profile_scores": {k: round(v, 3) for k, v in sorted(val_profiles.items())},
+                "knobs": candidate_knobs,
+            }
+            export_champion_json(meta, json_file)
+
+            delta_str = f"+{val_score - max(0.0, old_val):.3f}" if old_val >= 0 else "Baseline"
+            print(
+                f"\n  ********************************************************************************\n"
+                f"  *** NEW CHAMPION (Trial {trial_number:4d}): Val {old_val:.3f} -> {val_score:.3f} ({delta_str}) | Train: {train_score:.3f} | Valid: {val_valid}/{val_total} ***\n"
+                f"  ********************************************************************************"
+            )
+
+            # Print top 3 weakest & strongest profile scores for live insight
+            sorted_p = sorted(val_profiles.items(), key=lambda x: x[1])
+            weakest = ", ".join(f"{k}: {v:.1f}" for k, v in sorted_p[:3])
+            strongest = ", ".join(f"{k}: {v:.1f}" for k, v in sorted_p[-3:])
+            print(f"      Weakest Profiles : {weakest}")
+            print(f"      Strongest Profiles: {strongest}\n")
+
+            return True
+        else:
+            print(f"  [Val Check] Trial {trial_number:4d}: Val = {val_score:.3f} (Champ Val: {self.champion_val_score:.3f}, Valid: {val_valid}/{val_total})")
+            return False
+
+    def check_holdout(self, knobs: dict[str, Any], trial_number: int) -> float:
+        """Run unbiased evaluation against holdout.jsonl (report only)."""
+        holdout_score, holdout_profiles, hold_valid, hold_total = self.evaluate_dataset(self.holdout_path, knobs)
+        gap = self.champion_val_score - holdout_score
+        print(f"  [Holdout] Champion from Trial {trial_number:4d}: Holdout = {holdout_score:.3f} (Val: {self.champion_val_score:.3f}, Gap: {gap:+.3f}, Valid: {hold_valid}/{hold_total})")
+        return holdout_score
+
+    def restore_state_from_study(self, study: optuna.Study) -> None:
+        """Restore champion and elite state from existing SQLite study."""
+        completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+        if not completed_trials:
+            return
+
+        print(f"\n[Resume] Found {len(completed_trials)} completed trials in study '{self.study_name}'. Restoring state...")
+
+        # Reconstruct Elite Pool
+        for t in sorted(completed_trials, key=lambda x: x.value, reverse=True)[:25]:
+            self.elite_pool.add(t.params, t.value, t.value, t.number)
+
+        best_trial = max(completed_trials, key=lambda t: t.value)
+        self.all_time_best_train_fitness = best_trial.value
+        best_knobs = best_trial.params.copy()
+
+        # Re-evaluate best trial on current val set
+        val_score, val_profiles, val_valid, val_total = self.evaluate_dataset(self.val_path, best_knobs)
+        self.champion_val_score = val_score
+        self.champion_effective_val = val_score * (val_valid / max(val_total, 1))
+        self.champion_train_score = best_trial.value
+        self.champion_val_valid = val_valid
+        self.champion_val_total = val_total
+        self.champion_knobs = best_knobs.copy()
+        self.champion_trial = best_trial.number
+        self.last_promotion_trial = max(t.number for t in study.trials)
+
+        print(f"[Resume] Best trial in SQLite: Trial {best_trial.number} | Train Fitness: {best_trial.value:.4f} | Val: {val_score:.3f}")
+
+        # Check if saved champion.json has better candidate
+        json_file = self.output_dir / "champion.json"
+        if json_file.exists():
+            try:
+                with open(json_file, "rb") as f:
+                    saved = orjson.loads(f.read())
+                saved_knobs = saved.get("knobs", {})
+                if saved_knobs:
+                    sv_score, _, sv_valid, sv_total = self.evaluate_dataset(self.val_path, saved_knobs)
+                    sv_eff = sv_score * (sv_valid / max(sv_total, 1))
+                    if sv_eff > self.champion_effective_val:
+                        self.champion_val_score = sv_score
+                        self.champion_effective_val = sv_eff
+                        self.champion_knobs = saved_knobs.copy()
+                        self.champion_trial = saved.get("trial_id", -1)
+                        self.champion_train_score = saved.get("train_score", 0.0)
+                        self.champion_val_valid = sv_valid
+                        self.champion_val_total = sv_total
+                        print(f"[Resume] champion.json was superior: Trial {self.champion_trial} | Val: {sv_score:.3f} (Valid: {sv_valid}/{sv_total})")
+            except Exception as e:
+                print(f"[Resume] Warning reading champion.json: {e}")
+
+    def run_study(self, n_trials: int = 1500) -> optuna.Study:
+        """Run adaptive Multi-Phase Optimization Study with relative budgets."""
+
+        # Derive relative hyperparameters based on total trial budget
+        startup_trials = max(10, min(250, int(n_trials * self.startup_ratio)))
+        self.stagnation_window = max(20, min(120, int(n_trials * self.stagnation_ratio)))
+        val_freq = max(5, self.val_every)
+
+        print(f"\n================ Optimization Configuration ================")
+        print(f"  Target Budget       : {n_trials} trials")
+        print(f"  Startup Trials      : {startup_trials} ({self.startup_ratio * 100:.1f}%)")
+        print(f"  Stagnation Window   : {self.stagnation_window} trials ({self.stagnation_ratio * 100:.1f}%)")
+        print(f"  Validation Cadence  : every {val_freq} trials + immediate on record breaks")
+        print(f"  Fitness Mode        : {self.fitness_mode} (alpha={self.alpha:.2f}, power={self.power:.2f})")
+        print(f"  Parallel Threads    : {self.threads or 'all available'}")
+        print(f"============================================================")
+
+        # Initialize primary Multivariate TPE Sampler
+        tpe_sampler = TPESampler(
+            seed=self.seed,
+            n_startup_trials=startup_trials,
+            multivariate=True,
+            group=True,
+            constant_liar=True,
+        )
+
+        study = optuna.create_study(
+            study_name=self.study_name,
+            storage=self.storage,
+            sampler=tpe_sampler,
+            direction="maximize",
+            load_if_exists=True,
+        )
+
+        cal_records = []
+        if self.enable_calibration and self.calibration_dir.exists():
+            cal_records = load_calibration_records(self.calibration_dir)
+
+        existing_trials = len(study.trials)
+        is_resume = existing_trials > 0
+
+        if is_resume:
+            self.restore_state_from_study(study)
+            # Enqueue champion for warm start
+            study.enqueue_trial(self.champion_knobs)
+            print(f"[Resume] Enqueued champion knobs as trial {existing_trials} for warm-start anchor.")
+            for rec in cal_records:
+                self.elite_pool.add(rec.knobs, 0.0, 0.0, -1)
+        else:
+            # Seed Optuna with all calibration runs in descending score order
+            if cal_records:
+                print(f"\n[Warm-Start] Enqueuing {len(cal_records)} Real Judge calibration run(s) as anchor trials:")
+                for rec in cal_records:
+                    print(f"  -> Enqueued {rec.name:<22} (Real Score: {rec.real_score:.4f})")
+                    study.enqueue_trial(rec.knobs)
+                    self.elite_pool.add(rec.knobs, 0.0, 0.0, -1)
+                best_cal = cal_records[0].knobs
+            else:
+                best_cal = DEFAULT_KNOBS
+
+            # Evaluate top baseline on val set
+            val_base, _, v_val, v_tot = self.evaluate_dataset(self.val_path, best_cal)
+            self.champion_val_score = val_base
+            self.champion_effective_val = val_base * (v_val / max(v_tot, 1))
+            self.champion_train_score = val_base
+            self.champion_val_valid = v_val
+            self.champion_val_total = v_tot
+            self.champion_knobs = best_cal.copy()
+            print(f"[Baseline] Anchor Champion Val Score: {val_base:.3f} (Valid: {v_val}/{v_tot})\n")
+            if not cal_records:
+                study.enqueue_trial(DEFAULT_KNOBS)
+
+        # Recent candidate buffer for window validation
+        window_candidates: list[tuple[float, float, dict[str, Any], int]] = []
+        TOP_K_WINDOW = 3
+
+        def objective(trial: optuna.Trial) -> float:
+            nonlocal window_candidates
+
+            # -------------------- Phase Transition State Machine --------------------
+            trials_since_promotion = trial.number - self.last_promotion_trial
+
+            if trials_since_promotion >= self.stagnation_window:
+                if self.current_phase == "TPE_GLOBAL":
+                    # Transition: TPE -> IPOP CMA-ES
+                    print(f"\n>>> [Phase Shift] Stagnation ({trials_since_promotion} trials). Switching to IPOP CMA-ES local refinement...")
+                    self.current_phase = "CMAES_REFINE"
+                    self.phase_start_trial = trial.number
+                    self.last_promotion_trial = trial.number  # Reset counter for CMA-ES phase
+
+                    cma_sampler = CmaEsSampler(
+                        seed=self.seed + trial.number,
+                        n_startup_trials=0,
+                        with_margin=True,
+                        restart_strategy="ipop",
+                        inc_popsize=2,
+                    )
+                    study.sampler = cma_sampler
+                    study.enqueue_trial(self.champion_knobs)
+
+                elif self.current_phase == "CMAES_REFINE":
+                    # Transition: CMA-ES -> Elite Mutation & Basin Jumps
+                    print(f"\n>>> [Phase Shift] CMA-ES converged without promotion. Injecting Multi-Scale Elite Mutations & Basin Jumps...")
+                    self.current_phase = "ELITE_MUTATE"
+                    self.phase_start_trial = trial.number
+                    self.last_promotion_trial = trial.number
+
+                    # Enqueue multi-scale mutations around top elites
+                    elites = self.elite_pool.get_top(5)
+                    seeds_to_mutate = [e["knobs"] for e in elites] if elites else [self.champion_knobs]
+
+                    mutant_count = 0
+                    # Fine perturbations (sigma = 0.05)
+                    for base in seeds_to_mutate[:3]:
+                        study.enqueue_trial(mutate_knobs(base, scale=0.05, discrete_flip_prob=0.10, rng=self.rng))
+                        mutant_count += 1
+                    # Medium perturbations (sigma = 0.15)
+                    for base in seeds_to_mutate:
+                        study.enqueue_trial(mutate_knobs(base, scale=0.15, discrete_flip_prob=0.25, rng=self.rng))
+                        mutant_count += 1
+                    # Coarse exploratory basin jumps (sigma = 0.35)
+                    for base in seeds_to_mutate[:2]:
+                        study.enqueue_trial(mutate_knobs(base, scale=0.35, discrete_flip_prob=0.40, rng=self.rng))
+                        mutant_count += 1
+
+                    print(f"    Injected {mutant_count} multi-scale mutant candidates into optimization queue.")
+
+                elif self.current_phase == "ELITE_MUTATE":
+                    # Transition: Elite Mutation -> TPE Recycle
+                    print(f"\n>>> [Phase Shift] Re-seeding Multivariate TPE to assimilate explored basins...")
+                    self.current_phase = "TPE_GLOBAL"
+                    self.phase_start_trial = trial.number
+                    self.last_promotion_trial = trial.number
+
+                    recycle_tpe = TPESampler(
+                        seed=self.seed + trial.number * 31,
+                        n_startup_trials=max(5, int(startup_trials * 0.25)),
+                        multivariate=True,
+                        group=True,
+                        constant_liar=True,
+                    )
+                    study.sampler = recycle_tpe
+                    study.enqueue_trial(self.champion_knobs)
+
+            # -------------------- Candidate Evaluation --------------------
+            knobs = suggest_knobs(trial)
+            t0 = time.perf_counter()
+            payload = run_simulation_subprocess(self.exe_path, self.train_path, knobs, threads=self.threads)
+            elapsed = time.perf_counter() - t0
+
+            fitness, avg_score, floor_metric, _ = compute_fitness(
+                payload,
+                alpha=self.alpha,
+                fitness_mode=self.fitness_mode,
+                power=self.power,
+                beta=self.beta,
+                lambda_invalid=self.lambda_invalid,
+            )
+
+            valid_cnt = payload.get("valid_count", 0)
+            total = payload.get("total_testcases", 0)
+            sims_per_sec = payload.get("sims_per_sec", 0.0)
+
+            # Phase Tag
+            phase_tags = {
+                "TPE_GLOBAL": "TPE-Multi",
+                "CMAES_REFINE": "CMA-IPOP",
+                "ELITE_MUTATE": "Elite-Mut",
+            }
+            tag = phase_tags.get(self.current_phase, "TPE")
+            status_tag = f"Valid: {valid_cnt}/{total}" if valid_cnt == total else f"INVALID: {total - valid_cnt}/{total}"
+
+            print(
+                f"[Trial {trial.number:4d}] Train: {avg_score:6.2f} | Fitness: {fitness:6.2f} | "
+                f"ChampVal: {self.champion_val_score:6.2f} | {status_tag} | {tag:9s} | {sims_per_sec:4.0f} sim/s | {elapsed:.1f}s"
+            )
+
+            # -------------------- Elite Candidate Tracking --------------------
+            if valid_cnt == total:
+                self.elite_pool.add(knobs, fitness, avg_score, trial.number)
+                window_candidates.append((fitness, avg_score, knobs.copy(), trial.number))
+                window_candidates.sort(key=lambda x: x[0], reverse=True)
+                if len(window_candidates) > TOP_K_WINDOW:
+                    window_candidates = window_candidates[:TOP_K_WINDOW]
+
+            # -------------------- Dual Validation Triggers --------------------
+            # Trigger 1: Immediate Validation on Record Break
+            if valid_cnt == total and fitness > self.all_time_best_train_fitness:
+                old_best = self.all_time_best_train_fitness
+                self.all_time_best_train_fitness = fitness
+                if old_best > -1e8:
+                    print(f"  [Record] New All-Time Best Train Fitness ({old_best:.3f} -> {fitness:.3f}). Running immediate validation...")
+                    self.evaluate_and_promote_champion(knobs, trial.number, avg_score)
+
+            # Trigger 2: Periodic Batch Validation Gate
+            if (trial.number + 1) % val_freq == 0:
+                # 1. Validate top window candidates
+                for cand_fit, cand_avg, cand_knobs, cand_tnum in window_candidates:
+                    if self.evaluate_and_promote_champion(cand_knobs, cand_tnum, cand_avg):
+                        break
+
+                # 2. Also validate any unvalidated candidates in global elite pool
+                unvalidated = self.elite_pool.get_unvalidated()
+                if unvalidated:
+                    for elite_item in unvalidated:
+                        self.evaluate_and_promote_champion(
+                            elite_item["knobs"],
+                            elite_item["trial_number"],
+                            elite_item["avg_score"],
+                        )
+
+                window_candidates.clear()
+
+            return fitness
+
+        print(f"\n================ Starting Optimization ({n_trials} trials) ================")
+        study.optimize(objective, n_trials=n_trials)
+
+        # Final champion evaluation against holdout
+        print("\n================ Finalizing Study & Champion ================")
+        if self.champion_val_score > 0:
+            final_holdout = self.check_holdout(self.champion_knobs, self.champion_trial)
+            print(f"\nFinal Champion (Trial {self.champion_trial}):")
+            print(f"  Train Score         : {self.champion_train_score:.3f}")
+            print(f"  Val Score           : {self.champion_val_score:.3f}")
+            print(f"  Effective Val Score : {self.champion_effective_val:.3f}")
+            print(f"  Holdout Score       : {final_holdout:.3f}")
+            print(f"  Exported Artifacts  :")
+            print(f"    - {self.output_dir / 'champion.env'}")
+            print(f"    - {self.output_dir / 'champion.json'}\n")
+
+        return study
+
+
+# ============================ CLI & MAIN ============================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="High-Performance Multi-Phase Optuna Optimizer for Scheduler Knobs.",
+    )
+    parser.add_argument("--trials", "-n", type=int, default=1500, help="Number of trials to run (default: 1500).")
+    parser.add_argument("--train-size", type=int, default=16384, help="Number of testcases in train set (default: 16384).")
+    parser.add_argument("--val-size", type=int, default=8192, help="Number of testcases in validation set (default: 8192).")
+    parser.add_argument("--holdout-size", type=int, default=8192, help="Number of testcases in holdout set (default: 8192).")
+    parser.add_argument("--threads", "-t", "-j", type=int, default=0, help="OpenMP worker threads for Simulator (default: hardware max).")
+    parser.add_argument("--val-every", type=int, default=10, help="Evaluate champion on val set every M trials (default: 10).")
+    parser.add_argument("--startup-ratio", type=float, default=0.15, help="Fraction of trials allocated to random startup exploration (default: 0.15 = 15%%).")
+    parser.add_argument("--stagnation-ratio", type=float, default=0.06, help="Fraction of trials without improvement before phase shift (default: 0.06 = 6%%).")
+    parser.add_argument("--fitness-mode", type=str, default="avg_only", choices=["avg_only", "power_mean", "soft_min"], help="Fitness calculation formulation (default: avg_only).")
+    parser.add_argument("--alpha", type=float, default=0.70, help="Weight on overall mean score in fitness (default: 0.70).")
+    parser.add_argument("--power", type=float, default=0.50, help="Exponent p for generalized power-mean floor metric (default: 0.50).")
+    parser.add_argument("--study-name", type=str, default="study", help="Optuna study name.")
+    parser.add_argument("--storage", type=str, default="sqlite:///study.db", help="Optuna SQLite storage URI (default: sqlite:///study.db).")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
+    parser.add_argument("--calibration-dir", type=str, default="Calibration", help="Directory with Real Judge calibration runs (default: Calibration).")
+    parser.add_argument("--no-calibration", action="store_true", help="Disable calibration when auto-generating testcases.")
+
+    args = parser.parse_args()
+
+    trainer = KnobTrainer(
+        study_name=args.study_name,
+        storage=args.storage,
+        train_size=args.train_size,
+        val_size=args.val_size,
+        holdout_size=args.holdout_size,
+        threads=args.threads,
+        val_every=args.val_every,
+        startup_ratio=args.startup_ratio,
+        stagnation_ratio=args.stagnation_ratio,
+        fitness_mode=args.fitness_mode,
+        alpha=args.alpha,
+        power=args.power,
+        seed=args.seed,
+        calibration_dir=args.calibration_dir,
+        enable_calibration=not args.no_calibration,
+    )
+
+    # Automatically check testcase counts and generate if fewer than requested
+    trainer.ensure_datasets()
+
+    trainer.run_study(n_trials=args.trials)
 
 
 if __name__ == "__main__":

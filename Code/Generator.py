@@ -1,556 +1,1395 @@
-"""Part 1 -- stratified synthetic test-case generator.
-
-Emits JSON-lines; each object is self-contained enough for Simulator.py to play
-interactor without touching disk again. Bounds follow the problem statement's
-"Constraints"; the scoring parameters follow "Scoring".
-
-WHY THE SCORING PARAMETERS ARE *COMPUTED*, NOT SAMPLED
-------------------------------------------------------
-The statement pins tp_base and dist_base to a concrete artefact: "tp_base comes
-from a fixed one-request-at-a-time reference schedule" and dist_base is "the
-reference scheduler's amount above the waiting-time targets". Drawing them from
-thin air is what makes a synthetic benchmark useless for tuning: pick them too
-low and every knob setting scores 1000, too high and everything scores 0 -- in
-both cases the gradient the tuner needs is gone.
-
-So each case is calibrated:
-  * tp_base   = throughput of the reference schedule (Simulator.reference_schedule)
-  * dist_base = that same reference's SLO excess, so dist_base == 0 happens
-                exactly when the reference already meets both targets
-  * tp_UB     = tp_base + u * (work-conservation upper bound - tp_base)
-  * SLO1/SLO2 = multiples of the reference's own tdr/tpot
-On the judge's public test #1 this reproduces the test's own tp_base to all
-nine printed digits (see `python3 Simulator.py --validate-sample`).
-
-Every real is stored already rounded to the 9 decimals the protocol prints, so
-the value the scheduler reads is bit-identical to the value used for scoring.
 """
-from __future__ import annotations
+Generator.py — Generates diverse, high-quality, calibrated test cases for the Scheduler
+problem across multiple stress-test profiles and against Real Judge calibration runs.
+
+Produces a specified number of test cases (distributed evenly across profiles or for a
+specific profile) and writes them as a single JSONL file into Testcases/Raw.
+
+Key Calibration & Quality Features:
+  - Real Judge Calibration: Ingests real judge scores and weights from Calibration/
+    (*.json, *.env, *.csv, *.jsonl, or subdirectories).
+  - Zero-Score Filtering: Discards and replaces any testcase that yields a 0 score
+    (or invalid/error) under ANY of the provided calibration weights.
+  - Overall Rank-Order Consistency: Guarantees that if weights A scored higher than
+    weights B on the Real Judge (RealScore(A) > RealScore(B)), then weights A also
+    score higher than weights B on the generated testcase suite as a whole.
+  - Physically-Grounded Scoring: Automatically scales SLO1, SLO2, tp_base, tp_UB,
+    and dist_base relative to physical network transfer and compute lower bounds
+    so testcases provide smooth, discriminative gradients without degenerate clamping.
+
+Profiles:
+  - network_bottleneck   : high latency, low bandwidth, heavy tokens
+  - fast_network         : low latency, high bandwidth, light tokens
+  - compute_bottleneck   : fast network but slow task-time table entries
+  - high_schedule_cost   : S near max → rewards batching, punishes granularity
+  - throughput_only      : w_tp=1 → only output rate matters
+  - latency_only         : w_c=1  → only TDR / TPOT matter
+  - balanced             : 50/50 weights, moderate params
+  - single_remote        : K=1, no parallelism choice
+  - many_remotes         : K=8, stress load balancing
+  - burst_arrivals       : all requests at t=0
+  - streaming_arrivals   : requests trickle in slowly
+  - large_prefill        : large L_in, tests input stage
+  - long_decode          : large L_out, many output steps
+  - many_layers          : num_layers=64, splitting opportunities
+  - single_layer         : num_layers=1, no splitting
+  - heavy_transfer       : bytes_per_token near max, network-heavy
+  - stress_scale         : high R, near-max constraints
+  - adversarial_mixed    : intentionally mismatched dimensions
+  - random               : uniformly random within constraints
+
+Usage:
+    python Code/Generator.py <num_testcases> [options]
+"""
 
 import argparse
+import collections
+import csv
+import dataclasses
 import json
 import math
+import os
+from pathlib import Path
 import random
-from typing import Any, Sequence
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any
 
-import Simulator
 
-# ADDED: prefill_only, linear_scaling, and flash_crowd profiles
-PROFILES = ("latency_stress", "throughput_stress", "mixed_load", "large_R",
-            "small_K", "deep", "shallow", "prefill_only", "linear_scaling", "flash_crowd")
-ALL_PROFILES = PROFILES + ("mixed",)
+# ═══════════════════════════ DEFAULT KNOBS ═══════════════════════
+# Standard defaults matching Scheduler.h / Trainer.py
 
-# Round-robining the profiles gives each a share of the objective.
-# PROFILE_MIX["balanced"] is an explicit guess at a finals-like shape.
-PROFILE_MIX: dict[str, dict[str, int]] = {
-    "uniform": {p: 1 for p in PROFILES},
-    "balanced": {"mixed_load": 5, "large_R": 3, "deep": 3, "latency_stress": 3,
-                 "throughput_stress": 3, "small_K": 2, "shallow": 1,
-                 "prefill_only": 2, "linear_scaling": 2, "flash_crowd": 2},
+DEFAULT_KNOBS: dict[str, Any] = {
+    "SPT":              1,
+    "CHUNK":            1,
+    "CHUNK_SMULT":      117.072478194454,
+    "HOLD":             1,
+    "WAVES":            2.6067767581806,
+    "HOLD_WFRAC":       0.311336180161816,
+    "HOLD_SMULT":       35.7840349513665,
+    "UPGATE_FRAC":      0.133183223107648,
+    "UPPRE_MAX":        9,
+    "UPPRE_MAX_TP":     13,
+    "RATE_EFF":         0.785281063030896,
+    "DECW":             1.56316454998452,
+    "WAVES_PROC":       0,
+    "LATHOLD":          0,
+    "LATFRAC":          0.784885482322511,
+    "CONS":             1,
+    "CONS_PEN":         4.38521352191839,
+    "CHUNK_MINS":       83.0861287103681,
+    "CHUNK_TPP":        0.709332551776164,
+    "BASE_W":           0.0688174470439218,
+    "B_DPOST":          4.77937996680665,
+    "B_PPOST":          6.659109487552,
+    "B_DPRE":           2.11491371566828,
+    "B_PPRE":           3.59042054650082,
+    "B_DPROC":          5.46600299914945,
+    "B_PPROC":          0.210235165695655,
+    "AGE_FLOOR":        0.345735897111258,
+    "AGE_AW":           2.16669410499286,
+    "AGE_PRESS":        3.24529577274236,
+    "AGE_SLO_W":        20.5097192909652,
+    "AGE_NORM":         0,
+    "PPRE_AGECAP":      58607547317.7586,
+    "DECQ":             1.48621187428654,
+    "CHUNK_RATIO":      7.06079186759801,
+    "CHUNK_PRED":       0,
+    "LAT_MULT":         7.54176800349664,
+    "GATE_TDR":         1.27796897979818,
+    "HOLD_ACT":         39,
+    "HOLD_AW":          0.691000184000935,
+    "WAVE_CAPS_BATCH":  0,
 }
 
 
-def profile_sequence(n_cases: int, mix: str = "balanced") -> list[str]:
-    """A deterministic, interleaved profile order with the requested weights.
+# ═══════════════════════════ PROFILES ═══════════════════════════
+# Each profile defines characteristic parameter ranges.
 
-    Interleaved rather than blocked so that any *prefix* of the pool is
-    representative -- the median pruner judges trials on a prefix, and a
-    blocked order would judge them on one profile alone.
-    """
-    weights = PROFILE_MIX[mix]
-    order = [p for p in PROFILES if weights.get(p, 0) > 0]
-    out: list[str] = []
-    credit = {p: 0.0 for p in order}
-    total = float(sum(weights[p] for p in order))
-    for _ in range(n_cases):
-        for p in order:
-            credit[p] += weights[p] / total
-        pick = max(order, key=lambda p: (credit[p], -order.index(p)))
-        credit[pick] -= 1.0
-        out.append(pick)
-    return out
+DEFAULT_PROFILE: dict[str, Any] = {
+    # --- system ---
+    "K":                (2, 4),
+    "S":                (1.0, 5.0),
+    "latency_in_ms":    (0.5, 10.0),
+    "bandwidth_gbps":   (1.0, 50.0),
+    "bytes_per_token":  (1000, 500_000),
+    "num_layers":       (4, 32),
+    # --- scoring ---
+    "w_tp":             (0.3, 0.7),       # w_c = 1 - w_tp
+    "slo_tightness":    "moderate",       # tight | moderate | loose
+    # --- workload ---
+    "R":                (20, 200),
+    "L_in":             (64, 2048),       # per-request range
+    "L_out":            (4, 256),         # per-request range
+    "arrival":          "mixed",          # burst | stream | mixed
+    # --- task-time table ---
+    "N":                (5, 40),
+    "tt_shape":         "sublinear",      # sublinear | linear | superlinear | random
+}
 
-# --- statement "Constraints" -------------------------------------------------
-MAX_R = 2000
-MAX_LIN = 4096
-MAX_LOUT = 512
-TOKEN_BUDGET = 200_000          # sum_i L_out[i] <= 2e5 per test
-MAX_ARRIVAL = 1e9
-CELL_LO, CELL_HI = 0.001, 1e4
-SLO_LO, SLO_HI = 0.001, 1e9
+PROFILES: dict[str, dict[str, Any]] = {
+
+    # ──────── NETWORK STRESS ────────
+
+    "network_bottleneck": {
+        "latency_in_ms":   (10.0, 35.0),
+        "bandwidth_gbps":  (0.05, 0.8),
+        "bytes_per_token": (50_000, 500_000),
+        "tt_shape":        "sublinear",
+        "slo_tightness":   "moderate",
+    },
+    "fast_network": {
+        "latency_in_ms":   (0.001, 0.1),
+        "bandwidth_gbps":  (50.0, 100.0),
+        "bytes_per_token": (1, 5000),
+        "tt_shape":        "superlinear",
+        "slo_tightness":   "tight",
+    },
+    "heavy_transfer": {
+        "bytes_per_token": (200_000, 800_000),
+        "latency_in_ms":   (2.0, 20.0),
+        "bandwidth_gbps":  (0.8, 8.0),
+        "K":               (2, 6),
+        "slo_tightness":   "moderate",
+    },
+
+    # ──────── COMPUTE STRESS ────────
+
+    "compute_bottleneck": {
+        "latency_in_ms":   (0.001, 1.0),
+        "bandwidth_gbps":  (10.0, 100.0),
+        "bytes_per_token": (1, 10_000),
+        "tt_shape":        "superlinear",
+        "K":               (3, 8),
+        "slo_tightness":   "tight",
+    },
+    "high_schedule_cost": {
+        "S":               (6.0, 10.0),
+        "tt_shape":        "sublinear",
+        "R":               (40, 300),
+        "L_out":           (10, 256),
+        "slo_tightness":   "moderate",
+    },
+
+    # ──────── SCORING FOCUS ────────
+
+    "throughput_only": {
+        "w_tp":            1.0,
+        "R":               (80, 400),
+        "L_out":           (20, 384),
+        "arrival":         "burst",
+        "slo_tightness":   "loose",
+    },
+    "latency_only": {
+        "w_tp":            0.0,
+        "slo_tightness":   "tight",
+        "R":               (20, 150),
+        "L_out":           (1, 64),
+        "arrival":         "stream",
+    },
+    "balanced": {
+        "w_tp":            (0.4, 0.6),
+        "slo_tightness":   "moderate",
+    },
+
+    # ──────── TOPOLOGY ────────
+
+    "single_remote": {
+        "K":               1,
+        "num_layers":      (1, 16),
+        "R":               (10, 100),
+        "slo_tightness":   "moderate",
+    },
+    "many_remotes": {
+        "K":               8,
+        "R":               (80, 400),
+        "num_layers":      (8, 64),
+        "slo_tightness":   "tight",
+    },
+
+    # ──────── ARRIVAL PATTERN ────────
+
+    "burst_arrivals": {
+        "arrival":         "burst",
+        "R":               (40, 300),
+        "K":               (2, 8),
+        "slo_tightness":   "tight",
+    },
+    "streaming_arrivals": {
+        "arrival":         "stream",
+        "R":               (40, 250),
+        "slo_tightness":   "moderate",
+    },
+
+    # ──────── INPUT / OUTPUT SHAPE ────────
+
+    "large_prefill": {
+        "L_in":            (1024, 3072),
+        "L_out":           (1, 32),
+        "num_layers":      (16, 64),
+        "tt_shape":        "superlinear",
+        "slo_tightness":   "loose",
+    },
+    "long_decode": {
+        "L_in":            (1, 256),
+        "L_out":           (128, 450),
+        "R":               (10, 120),
+        "slo_tightness":   "tight",
+    },
+
+    # ──────── LAYER SPLITTING ────────
+
+    "many_layers": {
+        "num_layers":      64,
+        "K":               (3, 8),
+        "R":               (30, 200),
+        "slo_tightness":   "moderate",
+    },
+    "single_layer": {
+        "num_layers":      1,
+        "K":               (1, 4),
+        "slo_tightness":   "moderate",
+    },
+
+    # ──────── SCALE ────────
+
+    "stress_scale": {
+        "R":               (300, 1200),
+        "L_out":           (1, 60),
+        "K":               (4, 8),
+        "N":               (20, 100),
+        "slo_tightness":   "moderate",
+    },
+
+    # ──────── ADVERSARIAL ────────
+
+    "adversarial_mixed": {
+        "latency_in_ms":   (0.001, 0.5),
+        "bandwidth_gbps":  (20.0, 80.0),
+        "bytes_per_token": (100_000, 600_000),
+        "S":               (7.0, 10.0),
+        "K":               (4, 8),
+        "num_layers":      1,
+        "slo_tightness":   "moderate",
+        "R":               (80, 350),
+        "L_in":            (1, 3072),
+        "L_out":           (1, 384),
+        "arrival":         "burst",
+    },
+
+    # ──────── RANDOM BASELINE ────────
+
+    "random": {
+        "K":               (1, 8),
+        "S":               (1.0, 10.0),
+        "latency_in_ms":   (0.001, 35.0),
+        "bandwidth_gbps":  (0.05, 80.0),
+        "bytes_per_token": (1, 600_000),
+        "num_layers":      (1, 64),
+        "w_tp":            (0.0, 1.0),
+        "R":               (10, 400),
+        "L_in":            (1, 3072),
+        "L_out":           (1, 384),
+        "N":               (2, 60),
+        "tt_shape":        "random",
+        "arrival":         "mixed",
+        "slo_tightness":   "moderate",
+    },
+}
+
+ALL_PROFILE_NAMES = list(PROFILES.keys())
 
 
-def q9(x: float) -> float:
-    """Round to the 9 decimals the protocol prints, so printed == internal."""
-    return float(f"{x:.9f}")
+# ═════════════════════════ SAMPLING HELPERS ═════════════════════
+
+def _sample(spec: Any) -> Any:
+    """Sample a value from a profile spec."""
+    if isinstance(spec, (int, float, str)):
+        return spec
+    lo, hi = spec
+    if isinstance(lo, int) and isinstance(hi, int):
+        return random.randint(lo, hi)
+    return random.uniform(lo, hi)
 
 
-def _loguniform(rng: random.Random, lo: float, hi: float) -> float:
-    return math.exp(rng.uniform(math.log(lo), math.log(hi)))
+def _get(profile: dict, key: str) -> Any:
+    """Look up key in profile, falling back to DEFAULT_PROFILE."""
+    spec = profile.get(key, DEFAULT_PROFILE[key])
+    return _sample(spec)
 
 
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+# ════════════════ TASK-TIME TABLE GENERATION ════════════════════
+
+def _time_curve(batch_size: int, base_time: float, shape: str) -> float:
+    """Compute task duration for batch_size given base_time at bs=1."""
+    if shape == "sublinear":
+        return base_time * math.sqrt(batch_size)
+    elif shape == "linear":
+        return base_time * batch_size
+    elif shape == "superlinear":
+        return base_time * (batch_size ** 1.3)
+    else:  # random
+        return base_time * random.uniform(0.5, 3.0) * (batch_size ** random.uniform(0.4, 1.5))
 
 
-# ------------------------------------------------------------ system params --
-def _sys_params(rng: random.Random, profile: str) -> dict[str, Any]:
-    """System line 1: K S latency bandwidth bytes_per_token num_layers."""
-    if profile == "small_K":
-        K = 1 if rng.random() < 0.6 else 2
-    elif profile == "throughput_stress":
-        K = rng.randint(4, 8)
-    else:
-        K = rng.randint(1, 8)
+def _generate_task_time_table(num_rows: int, shape: str) -> list[dict[str, Any]]:
+    """Build the task-time table with num_rows rows."""
+    batch_sizes = {1}
+    for bs in [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]:
+        if len(batch_sizes) < num_rows:
+            batch_sizes.add(bs)
+    while len(batch_sizes) < num_rows:
+        batch_sizes.add(random.randint(1, 4096))
+    batch_sizes = sorted(batch_sizes)[:num_rows]
 
-    if profile == "latency_stress":               # link dominates compute
-        lat = rng.uniform(10.0, 50.0)
-        bw = rng.uniform(0.001, 0.05)
-        bpt = rng.randint(10 ** 4, 10 ** 6)
-    elif profile == "throughput_stress":          # compute dominates link
-        lat = rng.uniform(0.001, 0.5)
-        bw = rng.uniform(20.0, 100.0)
-        bpt = rng.randint(1, 4096)
-    else:
-        lat = 10 ** rng.uniform(-3, 1.7)
-        bw = 10 ** rng.uniform(-3, 2)
-        bpt = int(10 ** rng.uniform(0, 6))
+    step_columns = [
+        "prefill_pre", "prefill_proc", "prefill_post",
+        "decode_pre", "decode_proc", "decode_post",
+    ]
 
-    if profile == "deep":
-        layers = rng.randint(32, 64)
-    elif profile == "shallow":
-        layers = 1
-    else:
-        layers = rng.choice([1, 2, 4, 8, 16, 24, 32, 48, 64])
-
-    return dict(K=K,
-                S=_clamp(rng.uniform(1.0, 10.0), 1.0, 10.0),
-                latency_in_ms=_clamp(lat, 0.001, 50.0),
-                bandwidth_gbps=_clamp(bw, 0.001, 100.0),
-                bytes_per_token=max(1, min(10 ** 6, bpt)),
-                num_layers=max(1, min(64, layers)))
-
-
-# ------------------------------------------------------------- time table ----
-def _table(rng: random.Random, S: float, layers: int, profile: str) -> dict[str, Any]:
-    """Task-Time Table: N>=2 distinct batch sizes, >=1 non-missing cell per
-    column. Handles sub-linear (genuinely profitable batching) and linear_scaling
-    (penalized batching)."""
-    n = rng.choice([2, 3, 4, 6, 8, 12, 16, 24, 32, 64])
-    caps = sorted(rng.sample(range(1, MAX_LIN + 1), n))
-    if rng.random() < 0.5:                      # often list group size 1
-        caps[0] = 1
-    a_pre, a_proc, a_post = (10 ** rng.uniform(-2, 0.5) for _ in range(3))
-
-    # PATCH: If linear scaling profile, make batching scale linearly or super-linearly
-    if profile == "linear_scaling":
-        exp = rng.uniform(1.0, 1.1)
-        dexp = rng.uniform(1.0, 1.1)
-    else:
-        exp = rng.uniform(0.45, 0.95)               # sub-linear in batch size
-        dexp = exp * rng.uniform(0.55, 0.85)        # decode scales even better
-
-    rows: list[list[float]] = []
-    for b in caps:
-        scale = b ** exp
-        dscale = b ** dexp
-
-        def jit() -> float:
-            return rng.uniform(0.85, 1.18)
-
-        rows.append([float(b),
-                     a_pre * scale * S * jit(),
-                     a_proc * scale * S * layers * 0.05 * jit(),
-                     a_post * scale * S * jit(),
-                     a_pre * dscale * S * jit(),
-                     a_proc * dscale * S * layers * 0.02 * jit(),
-                     a_post * dscale * S * jit()])
-
-    for r in rows:                              # clamp + quantize every cell
-        for c in range(1, 7):
-            r[c] = max(CELL_LO, q9(_clamp(r[c], CELL_LO, CELL_HI)))
-
-    for col in range(1, 7):                     # -1 holes, keeping >=1 real cell
-        keep = rng.randrange(n)
-        for i in range(n):
-            if i != keep and rng.random() < 0.12:
-                rows[i][col] = -1.0
-
-    rng.shuffle(rows)                           # "Rows are given in no guaranteed order"
-    return dict(N=n, rows=rows)
-
-
-# --------------------------------------------------------------- requests ----
-def _requests(rng: random.Random, profile: str, token_budget: int, max_R: int,
-              tbl: Simulator.Table, S: float) -> list[dict[str, Any]]:
-    """Arrival stream: nondecreasing timestamps, hidden L_out, sum(L_out) capped."""
-    if profile == "large_R" or profile == "flash_crowd":
-        R = rng.randint(min(400, max_R), max_R)   # max_R may be below 400
-    else:
-        choices = [c for c in (1, 2, 5, 20, 60, 150, 400, 900) if c <= max_R]
-        R = rng.choice(choices or [max_R])
-    R = max(1, min(R, max_R))
-
-    lout_cap = max(1, min(MAX_LOUT, token_budget // R))
-    lens: list[tuple[int, int]] = []
-    budget = token_budget
-    for _ in range(R):
-        if budget <= 0:
-            break
-        L_in = max(1, min(MAX_LIN, int(10 ** rng.uniform(0, 3.6))))
-
-        # PATCH: If prefill_only, force L_out to 1 for all requests
-        if profile == "prefill_only":
-            L_out = 1
+    base_times = {}
+    for col in step_columns:
+        if "proc" in col:
+            base_times[col] = random.uniform(1.0, 25.0)
         else:
-            L_out = max(1, min(lout_cap,
-                               int(10 ** rng.uniform(0, math.log10(lout_cap) + 0.3))))
+            base_times[col] = random.uniform(0.1, 4.0)
 
-        L_out = min(L_out, budget)
-        budget -= L_out
-        lens.append((L_in, L_out))
+    rows = []
+    for bs in batch_sizes:
+        row = {"batch_size": bs}
+        for col in step_columns:
+            if random.random() < 0.12:
+                row[col] = -1.0
+                continue
+            raw = _time_curve(bs, base_times[col], shape)
+            jitter = random.uniform(0.88, 1.12)
+            val = max(0.001, min(10_000.0, raw * jitter))
+            row[col] = round(val, 9)
+        rows.append(row)
 
-    if not lens:
-        lens = [(1, 1)]
+    for col in step_columns:
+        if all(r[col] == -1.0 for r in rows):
+            chosen = random.choice(rows)
+            raw = _time_curve(chosen["batch_size"], base_times[col], shape)
+            chosen[col] = round(max(0.001, min(10_000.0, raw)), 9)
 
-    # Local-computer service rate
-    mean_lin = sum(a for a, _ in lens) / len(lens)
-    mean_lout = sum(b for _, b in lens) / len(lens)
-    g = 8.0
-    per_req = (2.0 * S + tbl.at(Simulator.C_PRE_PRE, mean_lin)
-               + tbl.at(Simulator.C_PRE_POST, mean_lin)
-               + mean_lout * (2.0 * S + tbl.at(Simulator.C_DEC_PRE, g)
-                              + tbl.at(Simulator.C_DEC_POST, g)) / g)
-    mu = 1.0 / max(per_req, 1e-9)
+    random.shuffle(rows)
+    return rows
 
-    if profile == "throughput_stress":
-        load = _loguniform(rng, 1.5, 12.0)
-    elif profile == "latency_stress":
-        load = _loguniform(rng, 0.4, 3.0)
-    else:
-        load = _loguniform(rng, 0.5, 8.0)
 
-    rate = max(mu * load, 1e-12)
+# ════════════════ REQUEST GENERATION ════════════════════════════
 
-    # PATCH: Force flash crowd pattern
-    if profile == "flash_crowd":
-        pattern = "flash"
-    else:
-        pattern = rng.choice(("poisson", "bursty", "uniform"))
-
+def _generate_requests(
+    R: int,
+    L_in_range: tuple,
+    L_out_range: tuple,
+    arrival_mode: str,
+    max_total_lout: int = 200_000,
+) -> list[dict[str, Any]]:
+    """Produce R requests with diverse L_in, L_out, and arrival patterns."""
+    requests = []
+    total_lout = 0
     t = 0.0
-    out: list[dict[str, Any]] = []
-    for L_in, L_out in lens:
-        if pattern == "flash":
-            t = 0.0
-        elif pattern == "poisson":
-            t += rng.expovariate(rate)
-        elif pattern == "uniform":
-            t += 1.0 / rate
-        else:                                   # bursty: bunches with idle gaps
-            t += 0.0 if rng.random() < 0.7 else rng.expovariate(rate / 6.0)
-        out.append(dict(rid=len(out), arrival=q9(min(t, MAX_ARRIVAL)),
-                        L_in=L_in, L_out=L_out))
-    return out
+
+    lin_lo, lin_hi = L_in_range
+    lout_lo, lout_hi = L_out_range
+
+    for rid in range(R):
+        l_in = random.randint(lin_lo, lin_hi)
+
+        remaining = max_total_lout - total_lout
+        eff_hi = min(lout_hi, remaining) if remaining > 0 else 1
+        eff_lo = min(lout_lo, eff_hi)
+        l_out = random.randint(max(1, eff_lo), max(1, eff_hi))
+        total_lout += l_out
+
+        if arrival_mode == "burst":
+            if random.random() < 0.85:
+                pass
+            else:
+                t += random.uniform(0.0, 2.0)
+        elif arrival_mode == "stream":
+            t += random.uniform(10.0, 250.0)
+        else:  # mixed
+            r = random.random()
+            if r < 0.45:
+                pass
+            elif r < 0.75:
+                t += random.uniform(0.0, 30.0)
+            else:
+                t += random.uniform(50.0, 400.0)
+
+        requests.append({
+            "rid":        rid,
+            "L_in":       l_in,
+            "L_out":      l_out,
+            "arrival_ms": round(t, 9),
+        })
+
+    return requests
 
 
-# -------------------------------------------------------------- calibration --
-def _draw_calibration(rng: random.Random, profile: str) -> dict[str, Any]:
-    """All random choices of the scoring line, drawn once and stored."""
-    r = rng.random()
-    if profile == "throughput_stress" or r < 0.25:
-        w_tp = rng.uniform(0.85, 1.0)
-    elif profile == "latency_stress" or r < 0.50:
-        w_tp = rng.uniform(0.0, 0.15)
+# ════════════════ PHYSICALLY-GROUNDED SCORING ════════════════════
+
+def _lookup_table_val(table_rows: list[dict], column: str, bs: int) -> float:
+    """Helper to do piecewise linear lookup in task-time table."""
+    pts = []
+    for r in table_rows:
+        val = r.get(column, -1.0)
+        if val >= 0.0:
+            pts.append((int(r["batch_size"]), float(val)))
+    if not pts:
+        return 1.0
+    pts.sort()
+    if bs <= pts[0][0]:
+        return pts[0][1]
+    if bs >= pts[-1][0]:
+        return pts[-1][1]
+    for i in range(len(pts) - 1):
+        if pts[i][0] <= bs <= pts[i+1][0]:
+            x0, y0 = pts[i]
+            x1, y1 = pts[i+1]
+            if x1 == x0:
+                return y0
+            return y0 + (bs - x0) / (x1 - x0) * (y1 - y0)
+    return pts[-1][1]
+
+
+def _generate_scoring(
+    profile: dict,
+    R: int,
+    avg_lout: float,
+    K: int,
+    S: float,
+    latency: float,
+    bandwidth: float,
+    bytes_per_token: int,
+    num_layers: int,
+    requests: list[dict],
+    task_time_table: list[dict],
+) -> dict[str, float]:
+    """
+    Generate physically realistic SLO and baseline parameters to prevent
+    degenerate 0-point score clamping while maintaining rigorous challenge targets.
+    """
+    w_tp_raw = _get(profile, "w_tp")
+    w_tp = round(float(w_tp_raw), 9)
+    w_c = round(1.0 - w_tp, 9)
+
+    tightness = profile.get("slo_tightness", DEFAULT_PROFILE["slo_tightness"])
+    if isinstance(tightness, tuple):
+        tightness = random.choice(["tight", "moderate", "loose"])
+
+    # Physical baseline estimates
+    avg_lin = sum(r["L_in"] for r in requests) / max(len(requests), 1)
+    tot_tokens = sum(r["L_out"] for r in requests)
+
+    # 1. Single-request prefill time (TDR lower bound)
+    xfer_prefill_up = latency + 8.0 * (avg_lin * bytes_per_token) / (bandwidth * 1e6)
+    xfer_prefill_down = latency + 8.0 * (avg_lin * bytes_per_token) / (bandwidth * 1e6)
+    t_pre_proc = _lookup_table_val(task_time_table, "prefill_proc", int(avg_lin))
+    t_pre_pre = _lookup_table_val(task_time_table, "prefill_pre", int(avg_lin))
+    t_pre_post = _lookup_table_val(task_time_table, "prefill_post", int(avg_lin))
+
+    single_tdr_phys = (
+        (S + t_pre_pre) +
+        xfer_prefill_up +
+        (S + t_pre_proc) +
+        xfer_prefill_down +
+        (S + t_pre_post)
+    )
+
+    # Queuing / scale factor based on R and K
+    queuing_factor = max(1.0, math.sqrt(R / max(K, 1)))
+    expected_tdr = single_tdr_phys * queuing_factor
+
+    # 2. Single-step decode time (TPOT lower bound)
+    xfer_dec_up = latency + 8.0 * bytes_per_token / (bandwidth * 1e6)
+    xfer_dec_down = latency + 8.0 * bytes_per_token / (bandwidth * 1e6)
+    t_dec_proc = _lookup_table_val(task_time_table, "decode_proc", 1)
+    t_dec_pre = _lookup_table_val(task_time_table, "decode_pre", 1)
+    t_dec_post = _lookup_table_val(task_time_table, "decode_post", 1)
+
+    single_tpot_phys = (
+        (S + t_dec_pre) +
+        xfer_dec_up +
+        (S + t_dec_proc) +
+        xfer_dec_down +
+        (S + t_dec_post)
+    )
+    expected_tpot = single_tpot_phys * max(1.0, math.sqrt(R / max(K * 2, 1)))
+
+    # 3. Overall makespan & throughput estimate
+    est_total_time = max(
+        expected_tdr + avg_lout * expected_tpot,
+        (tot_tokens * single_tpot_phys) / max(K, 1) + single_tdr_phys
+    )
+    est_tp = tot_tokens / max(est_total_time, 1.0)
+
+    # Scale targets based on tightness
+    if tightness == "tight":
+        SLO1 = max(0.001, expected_tdr * random.uniform(0.7, 1.2))
+        SLO2 = max(0.001, expected_tpot * random.uniform(0.7, 1.2))
+        dist_base = max(1.0, random.uniform(2.0, 8.0))
+        tp_base = max(0.0, est_tp * random.uniform(0.15, 0.45))
+        tp_UB = max(tp_base + 0.0001, est_tp * random.uniform(1.1, 2.2))
+    elif tightness == "moderate":
+        SLO1 = max(0.001, expected_tdr * random.uniform(1.2, 2.5))
+        SLO2 = max(0.001, expected_tpot * random.uniform(1.2, 2.5))
+        dist_base = max(1.0, random.uniform(4.0, 15.0))
+        tp_base = max(0.0, est_tp * random.uniform(0.05, 0.30))
+        tp_UB = max(tp_base + 0.0001, est_tp * random.uniform(1.3, 3.0))
+    else:  # loose
+        SLO1 = max(0.001, expected_tdr * random.uniform(2.5, 6.0))
+        SLO2 = max(0.001, expected_tpot * random.uniform(2.5, 6.0))
+        dist_base = max(1.0, random.uniform(10.0, 40.0))
+        tp_base = max(0.0, est_tp * random.uniform(0.01, 0.15))
+        tp_UB = max(tp_base + 0.0001, est_tp * random.uniform(1.5, 4.5))
+
+    return {
+        "SLO1":      round(SLO1, 9),
+        "SLO2":      round(SLO2, 9),
+        "tp_UB":     round(tp_UB, 9),
+        "tp_base":   round(tp_base, 9),
+        "dist_base": round(dist_base, 9),
+        "w_tp":      w_tp,
+        "w_c":       w_c,
+    }
+
+
+# ════════════════ FULL TEST CASE ASSEMBLY ═══════════════════════
+
+def generate_testcase(testcase_id: int, profile_name: str) -> dict[str, Any]:
+    """Build one complete test-case configuration using the named profile."""
+    profile = PROFILES.get(profile_name, {})
+
+    # System parameters
+    K               = int(_get(profile, "K"))
+    S               = round(float(_get(profile, "S")), 9)
+    latency         = round(float(_get(profile, "latency_in_ms")), 9)
+    bandwidth       = round(float(_get(profile, "bandwidth_gbps")), 9)
+    bytes_per_token = int(_get(profile, "bytes_per_token"))
+    num_layers      = int(_get(profile, "num_layers"))
+
+    # Requests
+    R = int(_get(profile, "R"))
+
+    lin_spec = profile.get("L_in", DEFAULT_PROFILE["L_in"])
+    if isinstance(lin_spec, (int, float)):
+        lin_range = (int(lin_spec), int(lin_spec))
     else:
-        w_tp = rng.uniform(0.2, 0.8)
-    if rng.random() < 0.06:
-        w_tp = 0.0 if rng.random() < 0.5 else 1.0
+        lin_range = (int(lin_spec[0]), int(lin_spec[1]))
 
-    if profile == "latency_stress":
-        f1lo, f1hi = 0.0005, 0.3
-    elif profile == "throughput_stress":
-        f1lo, f1hi = 0.01, 2.0
+    lout_spec = profile.get("L_out", DEFAULT_PROFILE["L_out"])
+    if isinstance(lout_spec, (int, float)):
+        lout_range = (int(lout_spec), int(lout_spec))
     else:
-        f1lo, f1hi = 0.001, 1.5
+        lout_range = (int(lout_spec[0]), int(lout_spec[1]))
 
-    return dict(
-        w_tp=q9(_clamp(w_tp, 0.0, 1.0)),
-        f1=_loguniform(rng, f1lo, f1hi),
-        f2=_loguniform(rng, 0.8, 8.0),
-        q=rng.uniform(0.15, 0.6) if profile == "throughput_stress"
-        else rng.uniform(0.25, 0.95),
-        m=_loguniform(rng, 0.8, 4.0),
-        generous=rng.random() < 0.15,
-        g1=_loguniform(rng, 1.05, 8.0),
-        g2=_loguniform(rng, 1.5, 20.0),
-        free1=rng.random() < 0.05,
-        free2=rng.random() < 0.05,
+    arrival_mode = profile.get("arrival", DEFAULT_PROFILE["arrival"])
+    if isinstance(arrival_mode, tuple):
+        arrival_mode = random.choice(["burst", "stream", "mixed"])
+
+    requests = _generate_requests(R, lin_range, lout_range, arrival_mode)
+    avg_lout = sum(r["L_out"] for r in requests) / max(len(requests), 1)
+
+    # Task-time table
+    N = int(_get(profile, "N"))
+    N = max(2, min(4096, N))
+    tt_shape = profile.get("tt_shape", DEFAULT_PROFILE["tt_shape"])
+    if isinstance(tt_shape, tuple):
+        tt_shape = random.choice(["sublinear", "linear", "superlinear", "random"])
+    task_time_table = _generate_task_time_table(N, tt_shape)
+
+    # Scoring parameters
+    scoring = _generate_scoring(
+        profile=profile,
+        R=R,
+        avg_lout=avg_lout,
+        K=K,
+        S=S,
+        latency=latency,
+        bandwidth=bandwidth,
+        bytes_per_token=bytes_per_token,
+        num_layers=num_layers,
+        requests=requests,
+        task_time_table=task_time_table,
+    )
+
+    return {
+        "testcase_id":      testcase_id,
+        "profile":          profile_name,
+        # System parameters
+        "K":                K,
+        "S":                S,
+        "latency_in_ms":    latency,
+        "bandwidth_gbps":   bandwidth,
+        "bytes_per_token":  bytes_per_token,
+        "num_layers":       num_layers,
+        # Scoring parameters
+        **scoring,
+        # Requests
+        "R":                R,
+        "requests":         requests,
+        # Task-time table
+        "N":                N,
+        "task_time_table":  task_time_table,
+    }
+
+
+def distribute_profiles(n: int) -> list[str]:
+    """Distribute n test cases across profiles."""
+    profiles = ALL_PROFILE_NAMES[:]
+    random.shuffle(profiles)
+
+    if n <= len(profiles):
+        return random.sample(profiles, n)
+
+    assigned = list(profiles)
+    remaining = n - len(assigned)
+    assigned += random.choices(profiles, k=remaining)
+    random.shuffle(assigned)
+    return assigned
+
+
+# ═════════════════ CALIBRATION DATA INGESTION ═══════════════════
+
+@dataclasses.dataclass
+class CalibrationRecord:
+    name: str
+    real_score: float
+    knobs: dict[str, Any]
+    source_path: Path | None = None
+    env: dict[str, str] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self):
+        # Build normalized V4_* environment variables
+        normalized_env = os.environ.copy()
+        for k, v in self.knobs.items():
+            k_clean = k[3:] if k.startswith("V4_") else k
+            normalized_env[f"V4_{k_clean}"] = str(v)
+        self.env = normalized_env
+
+
+def _parse_env_file(path: Path) -> CalibrationRecord | None:
+    """Parse a .env or shell export file looking for score and V4_* knobs."""
+    score: float | None = None
+    knobs: dict[str, Any] = {}
+
+    # Check filename for embedded score (e.g. weights_score_96.79.env)
+    fn_match = re.search(r'(?:score[_\-]?|=)(\d+(?:\.\d+)?)', path.stem, re.IGNORECASE)
+    if fn_match:
+        try:
+            score = float(fn_match.group(1))
+        except ValueError:
+            pass
+
+    # Check adjacent score file (e.g. name.score or score.txt)
+    adj_score = path.with_suffix(".score")
+    if adj_score.exists():
+        try:
+            score = float(adj_score.read_text(encoding="utf-8").strip())
+        except ValueError:
+            pass
+    adj_score2 = path.parent / "score.txt"
+    if score is None and adj_score2.exists():
+        try:
+            score = float(adj_score2.read_text(encoding="utf-8").strip())
+        except ValueError:
+            pass
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Check comment for score: e.g. # Real Score: 96.79
+            if line.startswith("#"):
+                m = re.search(r'(?:real[_\s]?score|judge[_\s]?score|score)[\s:=]+(\d+(?:\.\d+)?)', line, re.IGNORECASE)
+                if m:
+                    try:
+                        score = float(m.group(1))
+                    except ValueError:
+                        pass
+                continue
+
+            if line.startswith("export "):
+                line = line[7:].strip()
+
+            if "=" not in line:
+                continue
+
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip("'\"")
+
+            if k.upper() in {"REAL_SCORE", "SCORE", "JUDGE_SCORE", "VAL_SCORE", "CONTEST_SCORE"}:
+                try:
+                    score = float(v)
+                except ValueError:
+                    pass
+                continue
+
+            k_clean = k[3:] if k.startswith("V4_") else k
+            try:
+                if "." in v or "e" in v.lower():
+                    knobs[k_clean] = float(v)
+                else:
+                    knobs[k_clean] = int(v)
+            except ValueError:
+                knobs[k_clean] = v
+
+    if score is None:
+        return None
+
+    # Fill missing knobs with defaults
+    full_knobs = dict(DEFAULT_KNOBS)
+    full_knobs.update(knobs)
+
+    return CalibrationRecord(
+        name=path.stem,
+        real_score=score,
+        knobs=full_knobs,
+        source_path=path,
     )
 
 
-def _fallback_scales(case: dict, ref: dict, ideal: float) -> dict[str, float]:
-    P = max(2.0, min(float(len(case["requests"])), 4.0 * case["K"]))
-    return dict(tpot=max(ref["step"] * P, 1e-9), tp=max(ideal * 0.5, ref["tp"]))
+def _parse_json_file(path: Path) -> list[CalibrationRecord]:
+    """Parse JSON file containing single or multiple calibration records."""
+    records: list[CalibrationRecord] = []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return records
+
+    items = data if isinstance(data, list) else [data]
+
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+
+        # Detect score
+        score_val = (
+            item.get("real_score")
+            or item.get("score")
+            or item.get("val_score")
+            or item.get("judge_score")
+            or item.get("contest_score")
+        )
+        if score_val is None:
+            continue
+
+        try:
+            score = float(score_val)
+        except (ValueError, TypeError):
+            continue
+
+        # Extract knobs
+        knobs_dict = item.get("knobs") or item.get("weights") or item.get("params") or {}
+        if not knobs_dict:
+            # Maybe top-level keys are knobs
+            knobs_dict = {
+                k: v for k, v in item.items()
+                if (k.startswith("V4_") or k in DEFAULT_KNOBS)
+            }
+
+        full_knobs = dict(DEFAULT_KNOBS)
+        for k, v in knobs_dict.items():
+            k_clean = k[3:] if k.startswith("V4_") else k
+            full_knobs[k_clean] = v
+
+        name = item.get("name") or (f"{path.stem}_{idx}" if len(items) > 1 else path.stem)
+        records.append(
+            CalibrationRecord(
+                name=name,
+                real_score=score,
+                knobs=full_knobs,
+                source_path=path,
+            )
+        )
+
+    return records
 
 
-def probe_scales(case: dict, binary: str = "./scheduler",
-                 timeout_s: float = 120.0) -> dict[str, float] | None:
-    res = Simulator.run_one(case, {}, timeout_s=timeout_s, binary=binary)
-    if not res.ok or res.tp <= 0.0:
-        return None
-    tpot = res.mean_tpot if res.mean_tpot > 0 else None
-    if tpot is None:
-        return None
-    return dict(tpot=tpot, tp=res.tp, tdr=res.mean_tdr)
+def load_calibration_records(calibration_dir: Path) -> list[CalibrationRecord]:
+    """
+    Scan calibration directory and ingest all calibration records.
+    Returns list of CalibrationRecord sorted descending by real_score.
+    """
+    if not calibration_dir.exists():
+        return []
+
+    records: list[CalibrationRecord] = []
+    seen_names: set[str] = set()
+
+    for entry in sorted(calibration_dir.rglob("*")):
+        if entry.is_file():
+            ext = entry.suffix.lower()
+            if ext == ".json":
+                parsed_list = _parse_json_file(entry)
+                records.extend(parsed_list)
+            elif ext in {".env", ".sh", ".txt"}:
+                rec = _parse_env_file(entry)
+                if rec:
+                    records.append(rec)
+
+    # Deduplicate and sort descending by real judge score
+    unique_records: list[CalibrationRecord] = []
+    for r in records:
+        base_name = r.name
+        suffix = 1
+        while r.name in seen_names:
+            r.name = f"{base_name}_{suffix}"
+            suffix += 1
+        seen_names.add(r.name)
+        unique_records.append(r)
+
+    unique_records.sort(key=lambda r: r.real_score, reverse=True)
+    return unique_records
 
 
-def apply_calibration(case: dict, scales: dict[str, float]) -> dict:
-    cal = case["_cal"]
-    ref = Simulator.reference_schedule(case)
-    ideal = Simulator.ideal_throughput(case)
+# ═════════════════ SIMULATION & CALIBRATION EVALUATION ═════════
 
-    w_tp = cal["w_tp"]
-    w_c = q9(1.0 - w_tp)
+def run_simulation_batch(
+    testcases: list[dict[str, Any]],
+    calibration_records: list[CalibrationRecord],
+    simulator_exe: Path,
+    threads: int = 0,
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    Run fast in-memory Simulator.exe on the given testcases across all calibration records.
+    Returns {record.name: [sim_result_tc_0, sim_result_tc_1, ...]}.
+    """
+    if not testcases or not calibration_records:
+        return {}
 
-    generous = cal["generous"] or len(case["requests"]) <= 2
-    if generous:
-        SLO1 = ref["tdr"] * cal["g1"]
-        SLO2 = scales["tpot"] * cal["g2"]
+    # Write testcases to a temporary file
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8") as tmp:
+        tmp_path = Path(tmp.name)
+        for tc in testcases:
+            tmp.write(json.dumps(tc) + "\n")
+
+    results_by_record: dict[str, list[dict[str, Any]]] = {}
+
+    try:
+        for rec in calibration_records:
+            cmd = [str(simulator_exe), "--json", "-i", str(tmp_path)]
+            if threads > 0:
+                cmd.extend(["-t", str(threads)])
+
+            res = subprocess.run(cmd, capture_output=True, env=rec.env)
+            if res.returncode != 0:
+                raise RuntimeError(
+                    f"Simulator.exe failed for {rec.name} (code {res.returncode}):\n"
+                    f"{res.stderr.decode('utf-8', errors='replace')}"
+                )
+
+            payload = json.loads(res.stdout)
+            results_by_record[rec.name] = payload.get("results", [])
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    return results_by_record
+
+
+def check_pairwise_rank_consistency(
+    calibration_records: list[CalibrationRecord],
+    sim_averages: dict[str, float],
+    min_delta: float = 0.001,
+) -> tuple[bool, float, list[dict[str, Any]]]:
+    """
+    Check if the overall simulated suite scores preserve the Real Judge ranking.
+    Returns (is_consistent, kendall_tau, pairwise_details).
+    """
+    n = len(calibration_records)
+    if n < 2:
+        return True, 1.0, []
+
+    total_pairs = 0
+    concordant_pairs = 0
+    details = []
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            rec_a = calibration_records[i]
+            rec_b = calibration_records[j]
+
+            real_a = rec_a.real_score
+            real_b = rec_b.real_score
+            sim_a = sim_averages.get(rec_a.name, 0.0)
+            sim_b = sim_averages.get(rec_b.name, 0.0)
+
+            total_pairs += 1
+            if real_a > real_b:
+                passed = (sim_a > sim_b + min_delta)
+            elif real_a < real_b:
+                passed = (sim_b > sim_a + min_delta)
+            else:
+                passed = (abs(sim_a - sim_b) <= min_delta * 10.0)
+
+            if passed:
+                concordant_pairs += 1
+
+            details.append({
+                "rec_a": rec_a.name,
+                "rec_b": rec_b.name,
+                "real_a": real_a,
+                "real_b": real_b,
+                "sim_a": sim_a,
+                "sim_b": sim_b,
+                "passed": passed,
+            })
+
+    kendall_tau = (concordant_pairs / total_pairs) if total_pairs > 0 else 1.0
+    is_consistent = (concordant_pairs == total_pairs)
+    return is_consistent, kendall_tau, details
+
+
+# ═════════════════ CALIBRATED GENERATION ENGINE ════════════════
+
+def _compute_suite_loss(
+    totals: dict[str, float],
+    num_testcases: int,
+    calibration_records: list[CalibrationRecord],
+    min_delta: float = 0.001,
+) -> tuple[float, float, bool]:
+    """Compute rank inversion loss and Kendall's Tau over current totals."""
+    n = len(calibration_records)
+    if n < 2:
+        return 0.0, 1.0, True
+
+    loss = 0.0
+    total_pairs = 0
+    concordant_pairs = 0
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            rec_a = calibration_records[i]
+            rec_b = calibration_records[j]
+            real_a = rec_a.real_score
+            real_b = rec_b.real_score
+            avg_a = totals[rec_a.name] / num_testcases
+            avg_b = totals[rec_b.name] / num_testcases
+
+            total_pairs += 1
+            if real_a > real_b:
+                diff = (avg_b - avg_a) + min_delta
+                if diff > 0:
+                    loss += diff * diff + diff * 100.0
+                else:
+                    concordant_pairs += 1
+            elif real_a < real_b:
+                diff = (avg_a - avg_b) + min_delta
+                if diff > 0:
+                    loss += diff * diff + diff * 100.0
+                else:
+                    concordant_pairs += 1
+            else:
+                concordant_pairs += 1
+
+    tau = concordant_pairs / total_pairs if total_pairs > 0 else 1.0
+    is_consistent = (concordant_pairs == total_pairs)
+    return loss, tau, is_consistent
+
+
+def generate_calibrated_dataset(
+    num_testcases: int,
+    output_path: str | Path,
+    calibration_records: list[CalibrationRecord],
+    simulator_exe: Path,
+    seed: int | None = None,
+    profile: str | None = None,
+    threads: int = 0,
+    min_delta: float = 0.001,
+    candidates_per_slot: int = 3,
+    max_opt_rounds: int = 15,
+    verbose: bool = False,
+) -> tuple[dict[str, int], dict[str, float], float, int]:
+    """
+    Generate num_testcases with strict Zero-Score Filtering and Suite Monotonicity.
+    
+    Guarantees:
+      1. Every testcase scores > 0 for ALL calibration weights (no 0-point results).
+      2. If RealScore(A) > RealScore(B), then OverallSimScore(A) > OverallSimScore(B).
+    """
+    if seed is not None:
+        random.seed(seed)
+
+    if profile:
+        profile_plan = [profile] * num_testcases
     else:
-        SLO1 = ref["tdr"] * cal["f1"]
-        SLO2 = scales["tpot"] * cal["f2"]
-    if cal["free1"]:
-        SLO1 = SLO_HI
-    if cal["free2"]:
-        SLO2 = SLO_HI
-    SLO1 = _clamp(SLO1, SLO_LO, SLO_HI)
-    SLO2 = _clamp(SLO2, SLO_LO, SLO_HI)
+        profile_plan = distribute_profiles(num_testcases)
 
-    ex_tdr = max(0.0, (ref["tdr"] - SLO1) / SLO1)
-    ex_tpot = max(0.0, (ref["tpot"] - SLO2) / SLO2)
-    dist_base = _clamp(math.sqrt(ex_tdr ** 2 + ex_tpot ** 2), 0.0, 1e9)
-    if dist_base < 1e-6:
-        dist_base = 0.0
+    # For very large suites (e.g. >= 2048), 2 candidates per slot is fast and provides plenty of combinatorial freedom
+    pool_depth = 2 if num_testcases >= 2048 else max(2, candidates_per_slot)
 
-    if dist_base == 0.0:
-        SLO2 = max(SLO2, max(ref["step"], scales["tpot"]) * cal["g2"])
-        SLO2 = _clamp(SLO2, SLO_LO, SLO_HI)
-        SLO1 = max(SLO1, ref["tdr"] * 1.05)
-        SLO1 = _clamp(SLO1, SLO_LO, SLO_HI)
+    if verbose:
+        print(f"[*] Initializing candidate pools across {len(profile_plan)} slots ({len(calibration_records)} calibration runs)...")
 
-    tp_base = max(0.0, ref["tp"])
-    if scales.get("probed") and scales["tp"] > tp_base:
-        tp_UB = tp_base + (scales["tp"] - tp_base) / cal["q"]
+    candidate_pool: list[list[dict[str, Any]]] = [[] for _ in range(num_testcases)]
+    candidate_scores: list[list[dict[str, float]]] = [[] for _ in range(num_testcases)]
+    rejection_count = 0
+    tc_id_gen = 0
+
+    batch_chunk_size = 2048 if num_testcases >= 2048 else max(64, min(512, num_testcases * pool_depth))
+
+    # 1. Batched Generation & Parallel Simulation
+    round_count = 0
+    while round_count < 25:
+        round_count += 1
+        slots_needing = [s for s in range(num_testcases) if len(candidate_pool[s]) < pool_depth]
+        if not slots_needing:
+            break
+
+        batch_slots = slots_needing[:batch_chunk_size]
+        batch_tcs: list[tuple[int, dict[str, Any]]] = []
+        for s in batch_slots:
+            prof = profile_plan[s]
+            tc = generate_testcase(tc_id_gen, prof)
+            tc_id_gen += 1
+            batch_tcs.append((s, tc))
+
+        sim_res = run_simulation_batch([tc for _, tc in batch_tcs], calibration_records, simulator_exe, threads=threads)
+
+        for i, (s, tc) in enumerate(batch_tcs):
+            valid_for_all = True
+            c_scores: dict[str, float] = {}
+            for rec in calibration_records:
+                runs = sim_res.get(rec.name, [])
+                if i >= len(runs) or not runs[i].get("valid", False):
+                    valid_for_all = False
+                    break
+                score = float(runs[i].get("score", 0.0))
+                if score <= 0.0:
+                    valid_for_all = False
+                    break
+                c_scores[rec.name] = score
+
+            if valid_for_all:
+                candidate_pool[s].append(tc)
+                candidate_scores[s].append(c_scores)
+            else:
+                rejection_count += 1
+
+    # Fallback for any slot that has 0 valid candidates
+    unfilled = [s for s in range(num_testcases) if len(candidate_pool[s]) == 0]
+    if unfilled:
+        fb_batch = []
+        for s in unfilled:
+            tc = generate_testcase(tc_id_gen, "balanced")
+            tc_id_gen += 1
+            fb_batch.append((s, tc))
+        sim_res = run_simulation_batch([tc for _, tc in fb_batch], calibration_records, simulator_exe, threads=threads)
+        for i, (s, tc) in enumerate(fb_batch):
+            fb_scores = {}
+            for rec in calibration_records:
+                runs = sim_res.get(rec.name, [])
+                score = float(runs[i].get("score", 0.0)) if i < len(runs) else 0.0
+                fb_scores[rec.name] = score
+            candidate_pool[s].append(tc)
+            candidate_scores[s].append(fb_scores)
+
+    # 2. Coordinate Descent & Suite Assembly Optimization
+    chosen_indices = [0] * num_testcases
+    current_totals = {
+        r.name: sum(candidate_scores[s][chosen_indices[s]][r.name] for s in range(num_testcases))
+        for r in calibration_records
+    }
+    cur_loss, cur_tau, is_consistent = _compute_suite_loss(
+        current_totals, num_testcases, calibration_records, min_delta=min_delta
+    )
+
+    round_idx = 0
+    while not is_consistent and round_idx < max_opt_rounds:
+        round_idx += 1
+        if verbose:
+            print(f"[*] Optimization round {round_idx}/{max_opt_rounds}: Tau={cur_tau:.3f}, Loss={cur_loss:.2f}")
+
+        improved = False
+        slots_order = list(range(num_testcases))
+        random.shuffle(slots_order)
+
+        for slot_idx in slots_order:
+            if len(candidate_pool[slot_idx]) <= 1:
+                continue
+            best_idx = chosen_indices[slot_idx]
+            best_loss = cur_loss
+            old_cand_score = candidate_scores[slot_idx][best_idx]
+
+            for cand_idx in range(len(candidate_pool[slot_idx])):
+                if cand_idx == chosen_indices[slot_idx]:
+                    continue
+                new_cand_score = candidate_scores[slot_idx][cand_idx]
+
+                trial_totals = {
+                    r.name: current_totals[r.name] + (new_cand_score[r.name] - old_cand_score[r.name])
+                    for r in calibration_records
+                }
+
+                trial_loss, trial_tau, trial_consistent = _compute_suite_loss(
+                    trial_totals, num_testcases, calibration_records, min_delta=min_delta
+                )
+
+                if trial_loss < best_loss or (trial_loss == best_loss and trial_tau > cur_tau):
+                    best_loss = trial_loss
+                    best_idx = cand_idx
+                    best_totals = trial_totals
+                    best_tau = trial_tau
+                    best_consistent = trial_consistent
+                    improved = True
+
+            if improved and best_idx != chosen_indices[slot_idx]:
+                chosen_indices[slot_idx] = best_idx
+                current_totals = best_totals
+                cur_loss = best_loss
+                cur_tau = best_tau
+                is_consistent = best_consistent
+
+                if is_consistent:
+                    break
+
+        if is_consistent:
+            break
+
+    # 3. Assemble final suite
+    final_testcases: list[dict[str, Any]] = []
+    profile_counts: dict[str, int] = {}
+    for slot_idx in range(num_testcases):
+        chosen_tc = candidate_pool[slot_idx][chosen_indices[slot_idx]]
+        chosen_tc["testcase_id"] = slot_idx
+        final_testcases.append(chosen_tc)
+        prof = chosen_tc.get("profile", profile_plan[slot_idx])
+        profile_counts[prof] = profile_counts.get(prof, 0) + 1
+
+    sim_averages = {
+        r.name: current_totals[r.name] / num_testcases
+        for r in calibration_records
+    }
+
+    # 4. Write Output Dataset
+    out_file = Path(output_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_file, "w", encoding="utf-8") as f:
+        for tc in final_testcases:
+            f.write(json.dumps(tc) + "\n")
+
+    return profile_counts, sim_averages, cur_tau, rejection_count
+
+
+# ═════════════════ STANDARD (UNCALIBRATED) GENERATION ═════════
+
+def generate_dataset(
+    num_testcases: int,
+    output_path: str | Path,
+    seed: int | None = None,
+    profile: str | None = None,
+) -> dict[str, int]:
+    """Fallback standard dataset generator without calibration."""
+    if seed is not None:
+        random.seed(seed)
+
+    if profile:
+        profile_plan = [profile] * num_testcases
     else:
-        tp_UB = max(scales["tp"] * cal["m"], tp_base * 1.05)
-    tp_UB = _clamp(tp_UB, 1e-9, min(1e9, max(ideal * 3.0, tp_base * 1.05)))
+        profile_plan = distribute_profiles(num_testcases)
 
-    case.update(SLO1=q9(SLO1), SLO2=q9(SLO2), tp_UB=q9(tp_UB), tp_base=q9(tp_base),
-                dist_base=q9(dist_base), w_tp=w_tp, w_c=w_c)
-    if case["tp_UB"] <= case["tp_base"]:
-        case["tp_UB"] = q9(case["tp_base"] + max(1e-9, 0.05 * case["tp_base"]))
-    case["SLO1"] = _clamp(case["SLO1"], SLO_LO, SLO_HI)
-    case["SLO2"] = _clamp(case["SLO2"], SLO_LO, SLO_HI)
+    out_file = Path(output_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    case["meta"] = dict(ref_tp=ref["tp"], ref_tdr=ref["tdr"], ref_tpot=ref["tpot"],
-                        ref_step=ref["step"], ideal_tp=ideal, total_out=ref["total_out"],
-                        scale_tpot=scales["tpot"], scale_tp=scales["tp"],
-                        probed=bool(scales.get("probed", False)))
-    return case
+    profile_counts: dict[str, int] = {}
+    with open(out_file, "w", encoding="utf-8") as f:
+        for i, pname in enumerate(profile_plan):
+            tc = generate_testcase(i, pname)
+            f.write(json.dumps(tc) + "\n")
+            profile_counts[pname] = profile_counts.get(pname, 0) + 1
+
+    return profile_counts
 
 
-def calibrate(case: dict, probe: bool = False, binary: str = "./scheduler",
-              timeout_s: float = 120.0, rounds: int = 2) -> dict:
-    ref = Simulator.reference_schedule(case)
-    ideal = Simulator.ideal_throughput(case)
-    scales = _fallback_scales(case, ref, ideal)
-    apply_calibration(case, scales)
-    if probe:
-        for _ in range(max(1, rounds)):
-            measured = probe_scales(case, binary, timeout_s)
-            if measured is None:
-                break
-            scales = dict(tpot=max(measured["tpot"], ref["step"]),
-                          tp=max(measured["tp"], ref["tp"]), probed=True)
-            apply_calibration(case, scales)
-    check_case(case)
-    return case
+# ════════════════════════ CLI & MAIN ════════════════════════════
+
+def print_calibration_report(
+    calibration_records: list[CalibrationRecord],
+    sim_averages: dict[str, float],
+    kendall_tau: float,
+    total_testcases: int,
+    rejections: int,
+):
+    """Print clean, comprehensive calibration validation summary."""
+    print("\n" + "=" * 78)
+    print("                    CALIBRATION VALIDATION REPORT")
+    print("=" * 78)
+    print(f"  Total Suite Testcases : {total_testcases}")
+    print(f"  Zero-Score Rejections : {rejections} (Discarded non-viable testcases)")
+    print(f"  Kendall's Tau (Rank)  : {kendall_tau:.3f} ({kendall_tau * 100:.1f}% Pairwise Concordance)")
+    print("-" * 78)
+    print(f"  {'Configuration':<26} {'Real Score':<14} {'Sim Suite Score':<18} {'Real':<6} {'Sim':<6} {'Status'}")
+    print("  " + "-" * 74)
+
+    # Sort records by simulated score descending to show sim ranks
+    sim_sorted = sorted(calibration_records, key=lambda r: sim_averages.get(r.name, 0.0), reverse=True)
+    sim_rank_map = {r.name: (idx + 1) for idx, r in enumerate(sim_sorted)}
+
+    for real_rank, rec in enumerate(calibration_records, start=1):
+        sim_score = sim_averages.get(rec.name, 0.0)
+        sim_rank = sim_rank_map.get(rec.name, real_rank)
+        status = "MATCH (OK)" if real_rank == sim_rank else "INVERTED"
+        print(f"  {rec.name:<26} {rec.real_score:<14.3f} {sim_score:<18.3f} #{real_rank:<5} #{sim_rank:<5} {status}")
+
+    print("=" * 78 + "\n")
 
 
-# ------------------------------------------------------------------ assembly --
-def make_case(rng: random.Random, profile: str, token_budget: int = TOKEN_BUDGET,
-              max_R: int = MAX_R, force: dict[str, Any] | None = None) -> dict:
-    sysp = _sys_params(rng, profile)
-    if force:
-        sysp.update({k: v for k, v in force.items() if k in sysp})
-    case: dict[str, Any] = dict(profile=profile, **sysp)
-    case["S"] = q9(case["S"])
-    case["latency_in_ms"] = max(0.001, q9(case["latency_in_ms"]))
-    case["bandwidth_gbps"] = max(0.001, q9(case["bandwidth_gbps"]))
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate diverse, high-quality, calibrated test cases for the Scheduler "
+            "problem across multiple stress-test profiles with Real Judge calibration."
+        ),
+    )
+    parser.add_argument(
+        "num_testcases",
+        type=int,
+        nargs="?",
+        default=None,
+        help="Number of test cases to generate.",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default="testcases.jsonl",
+        help="Output filename (placed in Testcases/Raw). Default: testcases.jsonl",
+    )
+    parser.add_argument(
+        "--calibration-dir", "-c",
+        type=str,
+        default="Calibration",
+        help="Path to Calibration folder containing Real Judge scores and weights (default: Calibration).",
+    )
+    parser.add_argument(
+        "--no-calibration",
+        action="store_true",
+        help="Disable calibration and run standard uncalibrated generation.",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=0.001,
+        help="Minimum required score separation for strictly ordered calibration pairs (default: 0.001).",
+    )
+    parser.add_argument(
+        "--seed", "-s",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--profile", "-p",
+        type=str,
+        default=None,
+        choices=ALL_PROFILE_NAMES,
+        help="Force all test cases to use a single profile (default: mixed).",
+    )
+    parser.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="Print available profile names and exit.",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Print detailed generation and calibration progress.",
+    )
 
-    # PATCH: Pass profile to _table for correct scaling behavior
-    case["table"] = _table(rng, case["S"], case["num_layers"], profile)
+    args = parser.parse_args()
 
-    tbl = Simulator.Table(case["table"]["rows"])
-    case["requests"] = force["requests"] if (force and "requests" in force) else \
-        _requests(rng, profile, min(token_budget, TOKEN_BUDGET), min(max_R, MAX_R),
-                  tbl, case["S"])
-    case["_cal"] = _draw_calibration(rng, profile)
-    calibrate(case, probe=False)
-    if force:
-        for k, v in force.items():
-            if k != "requests" and k not in sysp:
-                case[k] = v
-        check_case(case)
-    return case
+    if args.list_profiles:
+        print("Available profiles:")
+        for name in ALL_PROFILE_NAMES:
+            print(f"  - {name}")
+        sys.exit(0)
 
+    if args.num_testcases is None:
+        parser.error("num_testcases is required (unless using --list-profiles).")
 
-def check_case(case: dict) -> None:
-    c = case
-    assert 1 <= c["K"] <= 8, c["K"]
-    assert 1.0 <= c["S"] <= 10.0, c["S"]
-    assert 0.001 <= c["latency_in_ms"] <= 50.0, c["latency_in_ms"]
-    assert 0.001 <= c["bandwidth_gbps"] <= 100.0, c["bandwidth_gbps"]
-    assert 1 <= c["bytes_per_token"] <= 10 ** 6, c["bytes_per_token"]
-    assert 1 <= c["num_layers"] <= 64, c["num_layers"]
-    assert 0.001 <= c["SLO1"] <= 1e9 and 0.001 <= c["SLO2"] <= 1e9
-    assert 0.0 <= c["dist_base"] <= 1e9, c["dist_base"]
-    assert 1e-9 <= c["tp_UB"] <= 1e9, c["tp_UB"]
-    assert c["tp_base"] >= 0.0 and c["tp_UB"] > c["tp_base"], (c["tp_base"], c["tp_UB"])
-    assert c["w_tp"] >= 0 and c["w_c"] >= 0
-    assert abs(c["w_tp"] + c["w_c"] - 1.0) < 1e-9, (c["w_tp"], c["w_c"])
+    if args.num_testcases < 1:
+        print("Error: num_testcases must be >= 1.", file=sys.stderr)
+        sys.exit(1)
 
-    t = c["table"]
-    assert 2 <= t["N"] <= 4096 and len(t["rows"]) == t["N"]
-    sizes = [int(r[0]) for r in t["rows"]]
-    assert len(set(sizes)) == len(sizes), "batch sizes must be distinct"
-    assert all(1 <= s <= 4096 for s in sizes)
-    for col in range(1, 7):
-        vals = [float(r[col]) for r in t["rows"] if float(r[col]) >= 0]
-        assert vals, f"column {col} is entirely missing"
-        assert all(CELL_LO <= v <= CELL_HI for v in vals), f"column {col} out of range"
+    # Resolve paths
+    script_dir = Path(__file__).resolve().parent          # …/Code
+    project_root = script_dir.parent                      # …/Scheduler
+    raw_dir = project_root / "Testcases" / "Raw"
+    output_path = raw_dir / args.output if not Path(args.output).is_absolute() else Path(args.output)
 
-    rs = c["requests"]
-    assert 1 <= len(rs) <= MAX_R, len(rs)
-    assert [r["rid"] for r in rs] == list(range(len(rs)))
-    prev = -1.0
-    for r in rs:
-        assert 0.0 <= r["arrival"] <= MAX_ARRIVAL
-        assert r["arrival"] >= prev, "arrivals must be nondecreasing"
-        prev = r["arrival"]
-        assert 1 <= r["L_in"] <= MAX_LIN
-        assert 1 <= r["L_out"] <= MAX_LOUT
-    assert sum(r["L_out"] for r in rs) <= TOKEN_BUDGET
+    calib_dir = project_root / args.calibration_dir if not Path(args.calibration_dir).is_absolute() else Path(args.calibration_dir)
 
+    # 1. Load Calibration Records
+    calibration_records = []
+    if not args.no_calibration:
+        calibration_records = load_calibration_records(calib_dir)
 
-def generate(n_cases: int, seed: int, profile: str = "mixed",
-             token_budget: int = TOKEN_BUDGET, max_R: int = MAX_R,
-             probe: bool = False, binary: str = "./scheduler",
-             timeout_s: float = 120.0, workers: int = 1,
-             probe_rounds: int = 2, mix: str = "balanced") -> list[dict]:
-    rng = random.Random(seed)
-    seq = (profile_sequence(n_cases, mix) if profile == "mixed"
-           else [profile] * n_cases)
-    cases = [make_case(rng, seq[i], token_budget, max_R) for i in range(n_cases)]
-    return (_probe_pool(cases, binary, timeout_s, workers, probe_rounds)
-            if probe else cases)
+    # Check if simulator binary is ready if calibrating
+    simulator_exe = script_dir / ("Simulator.exe" if os.name == "nt" else "Simulator")
 
+    if calibration_records:
+        if not simulator_exe.exists():
+            # Build using Simulator.py helper
+            try:
+                from Simulator import ensure_binary
+                simulator_exe = ensure_binary()
+            except Exception as e:
+                print(f"Warning: Could not compile Simulator.exe: {e}. Running in standard uncalibrated mode.")
+                calibration_records = []
 
-def _probe_pool(cases: list[dict], binary: str, timeout_s: float,
-                workers: int, rounds: int = 2) -> list[dict]:
-    if workers <= 1 or len(cases) <= 1:
-        return [calibrate(c, True, binary, timeout_s, rounds) for c in cases]
-    from concurrent.futures import ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(calibrate, c, True, binary, timeout_s, rounds) for c in cases]
-        return [f.result() for f in futs]
+    if calibration_records:
+        print(f"Loaded {len(calibration_records)} calibration run(s) from {calib_dir}:")
+        for idx, rec in enumerate(calibration_records, start=1):
+            print(f"  [{idx}] {rec.name:<25} Real Score: {rec.real_score:.4f}")
+        print()
 
+        profile_counts, sim_averages, tau, rejections = generate_calibrated_dataset(
+            num_testcases=args.num_testcases,
+            output_path=output_path,
+            calibration_records=calibration_records,
+            simulator_exe=simulator_exe,
+            seed=args.seed,
+            profile=args.profile,
+            min_delta=args.min_delta,
+            verbose=args.verbose,
+        )
 
-def edge_cases(seed: int = 1_234_567, token_budget: int = TOKEN_BUDGET,
-               probe: bool = False, binary: str = "./scheduler",
-               timeout_s: float = 120.0) -> list[dict]:
-    rng = random.Random(seed)
-    out: list[dict] = []
+        print_calibration_report(
+            calibration_records=calibration_records,
+            sim_averages=sim_averages,
+            kendall_tau=tau,
+            total_testcases=args.num_testcases,
+            rejections=rejections,
+        )
+    else:
+        if not args.no_calibration:
+            print(f"Note: No calibration files found in {calib_dir}. Running standard generation.")
+            print("Tip: Add *.json or *.env files with Real Judge scores to Calibration/ for calibrated generation.\n")
 
-    # PATCH: Added the new profiles to the degenerate canary set
-    specs: list[tuple[str, str, dict[str, Any], int]] = [
-        ("edge_K1", "small_K", dict(K=1), MAX_R),
-        ("edge_layers1", "shallow", dict(num_layers=1), MAX_R),
-        ("edge_singleR", "mixed_load", {}, 1),
-        ("edge_tp_only", "mixed_load", dict(w_tp=1.0, w_c=0.0), MAX_R),
-        ("edge_wait_only", "mixed_load", dict(w_tp=0.0, w_c=1.0), MAX_R),
-        ("edge_deep", "deep", {}, MAX_R),
-        ("edge_prefill", "prefill_only", {}, MAX_R),
-        ("edge_linear", "linear_scaling", {}, MAX_R),
-        ("edge_flash", "flash_crowd", {}, MAX_R),
-    ]
-    for name, profile, force, max_R in specs:
-        weights = {k: v for k, v in force.items() if k in ("w_tp", "w_c")}
-        sysf = {k: v for k, v in force.items() if k not in ("w_tp", "w_c")}
-        c = make_case(rng, profile, token_budget, max_R, sysf or None)
-        if weights:
-            c["_cal"]["w_tp"] = weights["w_tp"]
-            calibrate(c, probe=False)
-        if probe:
-            calibrate(c, True, binary, timeout_s)
-        c["profile"] = name
-        check_case(c)
-        out.append(c)
-    return out
+        profile_counts = generate_dataset(
+            num_testcases=args.num_testcases,
+            output_path=output_path,
+            seed=args.seed,
+            profile=args.profile,
+        )
 
-
-# ------------------------------------------------------------------ summary ---
-def summarize(cases: Sequence[dict]) -> str:
-    lines = [f"{'profile':<18} {'R':>5} {'tok':>7} {'K':>2} {'lay':>4} "
-             f"{'tp_base':>11} {'tp_UB':>11} {'ratio':>6} {'SLO1':>10} {'SLO2':>10} "
-             f"{'dist_base':>10} {'w_tp':>5}"]
-    for c in cases:
-        tok = sum(r["L_out"] for r in c["requests"])
-        ratio = c["tp_UB"] / c["tp_base"] if c["tp_base"] > 0 else float("inf")
-        lines.append(f'{c["profile"]:<18} {len(c["requests"]):5d} {tok:7d} {c["K"]:2d} '
-                     f'{c["num_layers"]:4d} {c["tp_base"]:11.6g} {c["tp_UB"]:11.6g} '
-                     f'{ratio:6.2f} {c["SLO1"]:10.4g} {c["SLO2"]:10.4g} '
-                     f'{c["dist_base"]:10.4g} {c["w_tp"]:5.2f}')
-    n0 = sum(1 for c in cases if c["dist_base"] == 0.0)
-    lines.append(f"\n{len(cases)} cases, dist_base==0 in {n0} "
-                 f"({100.0 * n0 / max(1, len(cases)):.0f}%), "
-                 f"median tokens {sorted(sum(r['L_out'] for r in c['requests']) for c in cases)[len(cases) // 2]}")
-    return "\n".join(lines)
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--n_cases", type=int, default=100)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--profile", choices=ALL_PROFILES, default="mixed")
-    ap.add_argument("--out", default="cases.jsonl")
-    ap.add_argument("--token_budget", type=int, default=TOKEN_BUDGET,
-                    help="cap on sum(L_out) per case; lower it for fast tuning")
-    ap.add_argument("--max_R", type=int, default=MAX_R)
-    ap.add_argument("--edge_cases", action="store_true",
-                    help="emit the degenerate canary set instead")
-    ap.add_argument("--probe", action="store_true",
-                    help="anchor the scoring line on a measured default-knob run")
-    ap.add_argument("--binary", default="./scheduler")
-    ap.add_argument("--timeout_s", type=float, default=120.0)
-    ap.add_argument("--workers", type=int, default=1)
-    ap.add_argument("--profile_mix", choices=tuple(PROFILE_MIX), default="balanced")
-    ap.add_argument("--summary", action="store_true")
-    a = ap.parse_args()
-
-    cases = (edge_cases(a.seed, a.token_budget, a.probe, a.binary, a.timeout_s)
-             if a.edge_cases
-             else generate(a.n_cases, a.seed, a.profile, a.token_budget, a.max_R,
-                           a.probe, a.binary, a.timeout_s, a.workers,
-                           mix=a.profile_mix))
-    with open(a.out, "w") as f:
-        for c in cases:
-            f.write(json.dumps(c) + "\n")
-    print(f"wrote {len(cases)} cases -> {a.out}")
-    if a.summary:
-        print(summarize(cases))
+    print(f"Generated {args.num_testcases} test case(s) -> {output_path}")
+    print("Profile distribution:")
+    for name in ALL_PROFILE_NAMES:
+        count = profile_counts.get(name, 0)
+        if count:
+            print(f"  {name:25s}  {count:3d}")
 
 
 if __name__ == "__main__":
