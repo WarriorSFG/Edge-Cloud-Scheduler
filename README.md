@@ -9,6 +9,10 @@ An ultra-high-performance, mathematically grounded scheduling engine and autonom
 - [Overview](#-overview)
 - [System Architecture & Lifecycle](#-system-architecture--lifecycle)
 - [Mathematical Foundation & Optimization Theory](#-mathematical-foundation--optimization-theory)
+  - [1. Max-Plus Task Completion Dynamics](#1-max-plus-task-completion-dynamics)
+  - [2. Dynamic FIFO Link Transfer Model](#2-dynamic-fifo-link-transfer-model)
+  - [3. Dynamic Decode Batching (Beta-Target & Tau-Holding Policy)](#3-dynamic-decode-batching-beta-target--tau-holding-policy)
+  - [4. Adaptive Prefill Chunking (Gamma-Policy)](#4-adaptive-prefill-chunking-gamma-policy)
 - [Repository Structure](#-repository-structure)
 - [End-to-End Pipeline & Tooling](#-end-to-end-pipeline--tooling)
   - [1. Calibrated Workload Generator (`Generator.py`)](#1-calibrated-workload-generator-generatorpy)
@@ -73,17 +77,17 @@ flowchart LR
 
 ## 🏗 System Architecture & Lifecycle
 
-Every request $i$ with input length $L_{\text{in}}[i]$ and hidden output length $L_{\text{out}}[i]$ passes through two primary stages:
+Every request $i$ with input length $L_{\mathrm{in}}[i]$ and hidden output length $L_{\mathrm{out}}[i]$ passes through two primary stages:
 
 ### 1. Input Stage (Prefill — Token-Free Setup)
-1. **`P PRE <remote> <rid>`** (Local Edge): Binds request $i$ to a chosen cloud worker $k \in [0, K)$. Automatically enqueues an uplink transfer carrying $L_{\text{in}}[i]$ tokens upon completion.
-2. **`P PROC <ls> <le> <remote> <rid>`** (Remote Cloud): Computes layers $[ls, le) \subseteq [0, \text{num\_layers})$. Can be executed as one contiguous piece or split across multiple non-overlapping slices. The final slice ($le = \text{num\_layers}$) automatically enqueues a downlink transfer of size $L_{\text{in}}[i]$.
+1. **`P PRE <remote> <rid>`** (Local Edge): Binds request $i$ to a chosen cloud worker $k \in [0, K)$. Automatically enqueues an uplink transfer carrying $L_{\mathrm{in}}[i]$ tokens upon completion.
+2. **`P PROC <ls> <le> <remote> <rid>`** (Remote Cloud): Computes layers $[ls, le) \subseteq [0, \text{num\_layers})$. Can be executed as one contiguous piece or split across multiple non-overlapping slices. The final slice ($le = \text{num\_layers}$) automatically enqueues a downlink transfer of size $L_{\mathrm{in}}[i]$.
 3. **`P POST <remote> <rid>`** (Local Edge): Finalizes the input stage. Marks the end of **Time to Decode Ready (TDR)** and readies the request for token generation.
 
-### 2. Output Stage (Decode — Repeated $L_{\text{out}}[i]$ Times)
+### 2. Output Stage (Decode — Repeated $L_{\mathrm{out}}[i]$ Times)
 1. **`D PRE -1 <m> <rid...>`** (Local Edge): Batches $m \ge 1$ ready requests spanning any combination of remote servers. Automatically forks independent uplink transfers to each represented remote server (enqueued in ascending server ID order).
 2. **`D PROC <remote> <m> <rid...>`** (Remote Cloud): Executes the output step for all batch members assigned to that specific cloud worker. Enqueues a downlink transfer of size $m$.
-3. **`D POST -1 <m> <rid...>`** (Local Edge): Emits exactly one token per member. When iteration $L_{\text{out}}[i]$ completes, the interactor yields a `FIN` event, retiring the request.
+3. **`D POST -1 <m> <rid...>`** (Local Edge): Emits exactly one token per member. When iteration $L_{\mathrm{out}}[i]$ completes, the interactor yields a `FIN` event, retiring the request.
 
 ---
 
@@ -94,10 +98,10 @@ The scheduling strategy is formally derived in [`Mathematics.md`](file:///c:/Use
 ### 1. Max-Plus Task Completion Dynamics
 For any compute task $v$ scheduled on resource $\rho(v) \in \{E, C_0, \dots, C_{K-1}\}$:
 
-$$C_v = \max\left(A_v,\; \max_{u \in \text{Pred}(v)} C_u,\; R_{\rho(v)}\right) + S + d_v$$
+$$C_v = \max\left(A_v,\; \max_{u \in \operatorname{Pred}(v)} C_u,\; R_{\rho(v)}\right) + S + d_v$$
 
 - $A_v$: Decision timestamp (frame arrival time).
-- $\text{Pred}(v)$: Set of formal prerequisite events (`ARR`, `TDN`, `XDN`).
+- $\operatorname{Pred}(v)$: Set of formal prerequisite events (`ARR`, `TDN`, `XDN`).
 - $R_{\rho(v)}$: Next available time of the physical execution unit.
 - $S$: Fixed scheduling cost overhead ($1 \le S \le 10\text{ ms}$).
 - $d_v$: Non-preemptive execution duration interpolated from the task-time table.
@@ -105,24 +109,32 @@ $$C_v = \max\left(A_v,\; \max_{u \in \text{Pred}(v)} C_u,\; R_{\rho(v)}\right) +
 ### 2. Dynamic FIFO Link Transfer Model
 Uplink and Downlink queues operate as independent, non-preemptive single-server FIFO channels:
 
-$$T(\textit{len}) = \text{latency\_in\_ms} + \frac{8 \cdot \textit{len} \cdot \text{bytes\_per\_token}}{\text{bandwidth\_gbps} \cdot 10^6}$$
+$$T(\mathrm{len}) = \text{latency} + \frac{8 \cdot \mathrm{len} \cdot \mathrm{BPT}}{\mathrm{BW} \cdot 10^6}$$
 
-$$C(Q_{\text{tail}}) = \max(A_{\text{entry}},\, Q_{\text{tail}}) + T(\textit{len})$$
+$$C(Q_{\mathrm{tail}}) = \max(A_{\mathrm{entry}},\, Q_{\mathrm{tail}}) + T(\mathrm{len})$$
 
-### 3. Dynamic Decode Batching ($\beta$-Target & $\tau$-Holding Policy)
+where:
+- $\text{latency}$ is link propagation delay in ms (`latency_in_ms`),
+- $\mathrm{BPT}$ is payload size per token in bytes (`bytes_per_token`),
+- $\mathrm{BW}$ is link bandwidth in Gbps (`bandwidth_gbps`),
+- $\mathrm{len}$ is the number of tokens transferred ($L_{\mathrm{in}}[i]$ for prefill, batch size $m$ for decode).
+
+### 3. Dynamic Decode Batching (Beta-Target & Tau-Holding Policy)
 Decode efficiency is maximized by adaptively balancing schedule overhead $S$ against latency targets:
 
-$$\beta = \text{clamp}\left(\left\lfloor W_1 \cdot S + W_2 \cdot \frac{w_{\text{tp}}}{w_{\text{tp}} + w_c} - W_3 \cdot \text{SLO}_2 + B_1 \right\rfloor,\; 1,\; \text{batch}_{\text{max}}\right)$$
+$$\beta = \operatorname{clamp}\left(\left\lfloor W_1 \cdot S + W_2 \cdot \frac{w_{\mathrm{tp}}}{w_{\mathrm{tp}} + w_c} - W_3 \cdot \mathrm{SLO}_2 + B_1 \right\rfloor,\; 1,\; \mathrm{batch}_{\max}\right)$$
 
-$$\tau = \max\left(0.0,\; W_4 \cdot \text{SLO}_2 - W_5 \cdot \text{latency\_in\_ms} + B_2\right)$$
+$$\tau = \max\left(0,\; W_4 \cdot \mathrm{SLO}_2 - W_5 \cdot \text{latency} + B_2\right)$$
 
 - If ready queue size $n \ge \beta$, the batch is dispatched immediately.
 - If $n < \beta$, the batch is held for at most $\tau$ ms, unless hold expiration or link starvation forces dispatch.
 
-### 4. Adaptive Prefill Chunking ($\gamma$-Policy)
+### 4. Adaptive Prefill Chunking (Gamma-Policy)
 Prefill operations on long sequences are split into $\gamma$ chunks to prevent head-of-line blocking on cloud workers:
 
-$$\gamma = \text{clamp}\left(\left\lfloor W_6 \cdot \frac{L_{\text{in}}[i]}{1000} + B_3 \right\rfloor,\; 1,\; \text{num\_layers}\right)$$
+$$\gamma = \operatorname{clamp}\left(\left\lfloor W_6 \cdot \frac{L_{\mathrm{in}}[i]}{1000} + B_3 \right\rfloor,\; 1,\; N_{\mathrm{layers}}\right)$$
+
+where $N_{\mathrm{layers}}$ is the total number of layers (`num_layers`).
 
 ---
 
@@ -199,7 +211,7 @@ flowchart TD
 #### Key Features:
 - **Zero-Score Elimination**: Re-generates any test case that fails or produces 0 points under any known baseline weights.
 - **Rank-Order Consistency**: Formally verifies that superior parameter configurations on the real judge maintain strictly higher aggregate scores on the generated benchmark suite.
-- **Physically Grounded Scaling**: Dynamically aligns $SLO_1$, $SLO_2$, $tp_{\text{base}}$, and $tp_{\text{UB}}$ against theoretical hardware and network lower bounds.
+- **Physically Grounded Scaling**: Dynamically aligns $\mathrm{SLO}_1$, $\mathrm{SLO}_2$, $tp_{\mathrm{base}}$, and $tp_{\mathrm{UB}}$ against theoretical hardware and network lower bounds.
 
 #### CLI Arguments:
 | Argument | Flag | Type | Default | Description |
@@ -410,22 +422,22 @@ To ensure robust generalization, [Generator.py](file:///c:/Users/Samarth/Downloa
 
 | Profile Name | Characteristic Dimensions | Stress Target |
 |---|---|---|
-| `network_bottleneck` | High latency ($35\text{ ms}$), low bandwidth ($0.05\text{ Gbps}$) | Network FIFO queuing & serialization |
-| `fast_network` | Microsecond latency, $100\text{ Gbps}$ bandwidth | Zero-delay link scheduling |
+| `network_bottleneck` | High latency (35 ms), low bandwidth (0.05 Gbps) | Network FIFO queuing & serialization |
+| `fast_network` | Microsecond latency, 100 Gbps bandwidth | Zero-delay link scheduling |
 | `compute_bottleneck` | High table compute durations, high $S$ | Compute resource contention |
 | `high_schedule_cost` | $S \approx 10\text{ ms}$ | Batch aggregation efficiency |
-| `throughput_only` | $w_{\text{tp}} = 1.0, w_c = 0.0$ | Pure token output rate maximization |
-| `latency_only` | $w_{\text{tp}} = 0.0, w_c = 1.0$ | Strict TDR and TPOT deadline preservation |
-| `balanced` | $w_{\text{tp}} = 0.5, w_c = 0.5$, moderate parameters | General operational equilibrium |
+| `throughput_only` | $w_{\mathrm{tp}} = 1.0, w_c = 0.0$ | Pure token output rate maximization |
+| `latency_only` | $w_{\mathrm{tp}} = 0.0, w_c = 1.0$ | Strict TDR and TPOT deadline preservation |
+| `balanced` | $w_{\mathrm{tp}} = 0.5, w_c = 0.5$, moderate parameters | General operational equilibrium |
 | `single_remote` | $K = 1$ | No multi-worker distribution choice |
 | `many_remotes` | $K = 8$ (maximum allowable) | High-concurrency load balancing |
 | `burst_arrivals` | All $R$ requests arrive at $t = 0$ | Surge prefill scheduling & memory buffers |
-| `streaming_arrivals` | Inter-arrival gaps up to $500\text{ ms}$ | Sparse queue hold/release dynamics |
-| `large_prefill` | Large $L_{\text{in}} \le 4096$ | Input stage transfer & prefill pressure |
-| `long_decode` | Large $L_{\text{out}} \le 512$ | Long-term decode holding stability |
-| `many_layers` | $\text{num\_layers} = 64$ | Multi-piece prefill splitting granularity |
-| `single_layer` | $\text{num\_layers} = 1$ | Prefill splitting disabled |
-| `heavy_transfer` | $\text{bytes\_per\_token} \approx 500{,}000$ | Memory footprint and transfer bandwidth |
+| `streaming_arrivals` | Inter-arrival gaps up to 500 ms | Sparse queue hold/release dynamics |
+| `large_prefill` | Large $L_{\mathrm{in}} \le 4096$ | Input stage transfer & prefill pressure |
+| `long_decode` | Large $L_{\mathrm{out}} \le 512$ | Long-term decode holding stability |
+| `many_layers` | `num_layers` = 64 | Multi-piece prefill splitting granularity |
+| `single_layer` | `num_layers` = 1 | Prefill splitting disabled |
+| `heavy_transfer` | `bytes_per_token` ≈ 500,000 | Memory footprint and transfer bandwidth |
 | `stress_scale` | Near-maximum $R$, $K$, and table constraints | System throughput limits |
 | `adversarial_mixed` | Mismatched compute/network bottlenecks | Anti-heuristic robustness |
 | `random` | Uniform random sampling across constraint space | Arbitrary edge-case discovery |
@@ -440,12 +452,12 @@ The scheduler's decision thresholds are parameterized by 10 mathematical knobs i
 |---|---|---|---|
 | `W1` | Weight of schedule cost $S$ in decode batching target $\beta$ | `7.890956` | $[0.0, 12.0]$ |
 | `W2` | Weight of normalized throughput weight in $\beta$ | `11.270364` | $[0.0, 12.0]$ |
-| `W3` | Weight of $\text{SLO}_2$ in decode batching target $\beta$ | `0.062483` | $[0.0, 1.0]$ |
+| `W3` | Weight of $\mathrm{SLO}_2$ in decode batching target $\beta$ | `0.062483` | $[0.0, 1.0]$ |
 | `B1` | Base additive bias in decode batching target $\beta$ | `20.968952` | $[-10.0, 25.0]$ |
-| `W4` | Weight of $\text{SLO}_2$ in decode holding time-to-live $\tau$ | `0.732383` | $[0.0, 3.0]$ |
+| `W4` | Weight of $\mathrm{SLO}_2$ in decode holding time-to-live $\tau$ | `0.732383` | $[0.0, 3.0]$ |
 | `W5` | Weight of network latency in holding time-to-live $\tau$ | `2.535072` | $[0.0, 3.0]$ |
 | `B2` | Base additive bias in holding time-to-live $\tau$ | `5.590653` | $[-10.0, 20.0]$ |
-| `W6` | Weight of input length ($L_{\text{in}} / 1000$) in chunk count $\gamma$ | `17.162321` | $[0.0, 25.0]$ |
+| `W6` | Weight of input length ($L_{\mathrm{in}} / 1000$) in chunk count $\gamma$ | `17.162321` | $[0.0, 25.0]$ |
 | `B3` | Base additive bias in chunk count $\gamma$ | `9.145199` | $[-10.0, 20.0]$ |
 | `URG_SCALE`| Global multiplier for latency urgency prioritization | `19.887632` | $[0.1, 25.0]$ |
 
@@ -455,22 +467,22 @@ The scheduler's decision thresholds are parameterized by 10 mathematical knobs i
 
 The official evaluation assigns a normalized score in $[0, 1000]$ per test case:
 
-$$\text{Score} = 1000 \cdot \left[ w_{\text{tp}} \cdot \text{clamp}\left(tp;\; tp_{\text{base}},\, tp_{\text{UB}}\right) + w_c \cdot \text{clamp}\left(dist;\; dist_{\text{base}},\, 0\right) \right]$$
+$$\mathrm{Score} = 1000 \cdot \left[ w_{\mathrm{tp}} \cdot \operatorname{clamp}\left(tp;\; tp_{\mathrm{base}},\, tp_{\mathrm{UB}}\right) + w_c \cdot \operatorname{clamp}\left(dist;\; dist_{\mathrm{base}},\, 0\right) \right]$$
 
 ### 1. Throughput Component
-$$tp = \frac{\sum_{i=0}^{R-1} L_{\text{out}}[i]}{\max_i(\text{FinalToken}_i) - \min_i(\text{Arrival}_i)} \quad (\text{tokens/ms})$$
+$$tp = \frac{\sum_{i=0}^{R-1} L_{\mathrm{out}}[i]}{\max_i(\mathrm{FinalToken}_i) - \min_i(\mathrm{Arrival}_i)} \quad (\text{tokens/ms})$$
 
-$$\text{Throughput Component} = \max\left(0,\, \min\left(1,\, \frac{tp - tp_{\text{base}}}{tp_{\text{UB}} - tp_{\text{base}}}\right)\right)$$
+$$\text{Throughput Component} = \max\left(0,\, \min\left(1,\, \frac{tp - tp_{\mathrm{base}}}{tp_{\mathrm{UB}} - tp_{\mathrm{base}}}\right)\right)$$
 
 ### 2. Waiting-Time (Latency) Component
-- **$\text{TDR}$**: Mean duration from arrival to prefill completion ($\text{P POST}$).
-- **$\text{TPOT}$**: Mean interval between consecutive token emissions ($\text{D POST}$) across all requests.
+- **$\mathrm{TDR}$**: Mean duration from arrival to prefill completion (`P POST`).
+- **$\mathrm{TPOT}$**: Mean interval between consecutive token emissions (`D POST`) across all requests.
 
-$$excess_{\text{TDR}} = \max\left(0,\, \frac{\text{TDR} - \text{SLO}_1}{\text{SLO}_1}\right), \quad excess_{\text{TPOT}} = \max\left(0,\, \frac{\text{TPOT} - \text{SLO}_2}{\text{SLO}_2}\right)$$
+$$\mathrm{excess}_{\mathrm{TDR}} = \max\left(0,\, \frac{\mathrm{TDR} - \mathrm{SLO}_1}{\mathrm{SLO}_1}\right), \quad \mathrm{excess}_{\mathrm{TPOT}} = \max\left(0,\, \frac{\mathrm{TPOT} - \mathrm{SLO}_2}{\mathrm{SLO}_2}\right)$$
 
-$$dist = \sqrt{excess_{\text{TDR}}^2 + excess_{\text{TPOT}}^2}$$
+$$dist = \sqrt{\mathrm{excess}_{\mathrm{TDR}}^2 + \mathrm{excess}_{\mathrm{TPOT}}^2}$$
 
-$$\text{Waiting-Time Component} = \begin{cases} \max\left(0,\, 1 - \frac{dist}{dist_{\text{base}}}\right) & \text{if } dist_{\text{base}} > 0 \\ 1 & \text{if } dist_{\text{base}} = 0 \text{ and } dist = 0 \\ 0 & \text{if } dist_{\text{base}} = 0 \text{ and } dist > 0 \end{cases}$$
+$$\text{Waiting-Time Component} = \begin{cases} \max\left(0,\, 1 - \frac{dist}{dist_{\mathrm{base}}}\right) & \text{if } dist_{\mathrm{base}} > 0, \\ 1 & \text{if } dist_{\mathrm{base}} = 0 \text{ and } dist = 0, \\ 0 & \text{if } dist_{\mathrm{base}} = 0 \text{ and } dist > 0. \end{cases}$$
 
 ---
 
