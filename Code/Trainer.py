@@ -58,6 +58,7 @@ from Simulator import ensure_binary
 
 
 # ============================ KNOB SPECIFICATIONS ============================
+<<<<<<< Updated upstream
 # Mathematical parameters from Mathematics.md & Schedulers/Scheduler.h.
 
 KNOB_SPECS: dict[str, dict[str, Any]] = {
@@ -78,12 +79,31 @@ KNOB_SPECS: dict[str, dict[str, Any]] = {
 
     # -- Priority Urgency Scaling per Mathematics.md §21-22 --
     "URG_SCALE":    {"type": "float", "low": 0.5, "high": 2.5, "default": 1.20},
+=======
+# 10 mathematical workflow parameters from Mathematics.md & TuningKnobs / KnobSet.
+# Expanded fearless search bounds for deep gradient exploration.
+
+KNOB_SPECS: dict[str, dict[str, Any]] = {
+    "W1":        {"type": "float", "low": 0.0,   "high": 12.0, "default": 1.477513243077123},
+    "W2":        {"type": "float", "low": 0.0,   "high": 12.0, "default": 2.0618695279290793},
+    "W3":        {"type": "float", "low": 0.0,   "high": 1.0,  "default": 0.04881820865819875},
+    "B1":        {"type": "float", "low": -10.0, "high": 25.0, "default": 2.7398213369682245},
+    "W4":        {"type": "float", "low": 0.0,   "high": 3.0,  "default": 0.35403860334134957},
+    "W5":        {"type": "float", "low": 0.0,   "high": 3.0,  "default": 0.3732723085347498},
+    "B2":        {"type": "float", "low": -10.0, "high": 20.0, "default": 1.103002753683954},
+    "W6":        {"type": "float", "low": 0.0,   "high": 25.0, "default": 5.911434444900584},
+    "B3":        {"type": "float", "low": -10.0, "high": 20.0, "default": 1.8621518934750698},
+    "URG_SCALE": {"type": "float", "low": 0.1,   "high": 25.0, "default": 2.099102751723999},
+>>>>>>> Stashed changes
 }
 
 DEFAULT_KNOBS: dict[str, Any] = {name: spec["default"] for name, spec in KNOB_SPECS.items()}
 
 
+<<<<<<< Updated upstream
 
+=======
+>>>>>>> Stashed changes
 def suggest_knobs(trial: optuna.Trial) -> dict[str, Any]:
     """Suggest all parameters in unified search space."""
     params = {}
@@ -144,10 +164,18 @@ def mutate_knobs(
 
 
 def knobs_to_env(knobs: dict[str, Any]) -> dict[str, str]:
+<<<<<<< Updated upstream
     """Convert knob dict to V4_* environment variables."""
     env = os.environ.copy()
     for name, val in knobs.items():
         env[f"V4_{name}"] = str(val)
+=======
+    """Convert knob dict to V4_* and raw environment variables."""
+    env = os.environ.copy()
+    for name, val in knobs.items():
+        env[f"V4_{name}"] = str(val)
+        env[name] = str(val)
+>>>>>>> Stashed changes
     return env
 
 
@@ -159,6 +187,10 @@ def export_champion_env(knobs: dict[str, Any], filepath: Path) -> None:
         f.write(f"# Timestamp: {datetime.datetime.now().isoformat()}\n\n")
         for name, val in sorted(knobs.items()):
             f.write(f"export V4_{name}={val}\n")
+<<<<<<< Updated upstream
+=======
+            f.write(f"export {name}={val}\n")
+>>>>>>> Stashed changes
 
 
 def export_champion_json(metadata: dict[str, Any], filepath: Path) -> None:
@@ -169,6 +201,7 @@ def export_champion_json(metadata: dict[str, Any], filepath: Path) -> None:
 
 
 def count_jsonl_lines(path: Path) -> int:
+<<<<<<< Updated upstream
     """Count non-empty lines in a JSONL file."""
     if not path.exists():
         return 0
@@ -177,6 +210,15 @@ def count_jsonl_lines(path: Path) -> int:
         for line in f:
             if line.strip():
                 count += 1
+=======
+    """Count non-empty lines in a JSONL file quickly using binary block reading."""
+    if not path.exists():
+        return 0
+    count = 0
+    with open(path, "rb") as f:
+        while chunk := f.read(1024 * 1024):
+            count += chunk.count(b"\n")
+>>>>>>> Stashed changes
     return count
 
 
@@ -264,6 +306,7 @@ def compute_fitness(
     else:
         floor_metric = avg_score
 
+<<<<<<< Updated upstream
     invalid_ratio = invalid_count / max(total, 1)
     invalid_penalty = lambda_invalid * invalid_ratio * 1000.0
 
@@ -271,6 +314,32 @@ def compute_fitness(
         fitness = avg_score - invalid_penalty
     else:
         fitness = alpha * avg_score + (1.0 - alpha) * floor_metric - invalid_penalty
+=======
+    # Lower-tail risk and deviation calculations
+    sorted_scores = sorted(all_scores)
+    k_tail = max(1, int(len(sorted_scores) * 0.10))
+    cvar_tail = sum(sorted_scores[:k_tail]) / k_tail
+    
+    # Downside semi-variance against median benchmark (500.0)
+    downside_variance = sum(max(0.0, 500.0 - s) ** 2 for s in all_scores) / max(len(all_scores), 1)
+    downside_dev = math.sqrt(downside_variance)
+
+    # Zero score ratio penalty
+    zero_score_count = sum(1 for s in all_scores if s <= 1e-4)
+    zero_penalty = (zero_score_count / max(len(all_scores), 1)) * 100.0
+
+    invalid_ratio = invalid_count / max(total, 1)
+    invalid_penalty = lambda_invalid * invalid_ratio * 1000.0
+
+    if fitness_mode == "power_mean":
+        fitness = alpha * avg_score + (1.0 - alpha) * floor_metric - 0.15 * downside_dev - zero_penalty - invalid_penalty
+    elif fitness_mode == "tail_risk":
+        fitness = 0.50 * avg_score + 0.30 * floor_metric + 0.20 * cvar_tail - 0.25 * downside_dev - zero_penalty - invalid_penalty
+    elif fitness_mode == "soft_min":
+        fitness = alpha * avg_score + (1.0 - alpha) * floor_metric - 0.15 * downside_dev - zero_penalty - invalid_penalty
+    else:  # avg_only
+        fitness = avg_score - 0.10 * downside_dev - zero_penalty - invalid_penalty
+>>>>>>> Stashed changes
 
     return fitness, avg_score, floor_metric, profile_means
 
@@ -457,6 +526,7 @@ class KnobTrainer:
                 print(f"[Dataset] Generating {count_needed} testcases for {name} -> {path}...")
                 generate_dataset(count_needed, path, seed=seed)
 
+<<<<<<< Updated upstream
         if train_count != self.train_size:
             print(f"[Dataset] Train set has {train_count} testcases (need {self.train_size}). Regenerating...")
             _generate(self.train_size, self.train_path, self.seed, "Train")
@@ -470,6 +540,20 @@ class KnobTrainer:
             _generate(self.holdout_size, self.holdout_path, self.seed + 2000, "Holdout")
 
 
+=======
+        if train_count < self.train_size:
+            print(f"[Dataset] Train set has {train_count} testcases (need {self.train_size}).")
+            _generate(self.train_size, self.train_path, self.seed, "Train")
+
+        if val_count < self.val_size:
+            print(f"[Dataset] Val set has {val_count} testcases (need {self.val_size}).")
+            _generate(self.val_size, self.val_path, self.seed + 1000, "Validation")
+
+        if holdout_count < self.holdout_size:
+            print(f"[Dataset] Holdout set has {holdout_count} testcases (need {self.holdout_size}).")
+            _generate(self.holdout_size, self.holdout_path, self.seed + 2000, "Holdout")
+
+>>>>>>> Stashed changes
     def evaluate_dataset(self, dataset_path: Path, knobs: dict[str, Any]) -> tuple[float, dict[str, float], int, int]:
         """Evaluate a dataset and return (avg_score, profile_means, valid_count, total)."""
         payload = run_simulation_subprocess(self.exe_path, dataset_path, knobs, threads=self.threads)
@@ -665,14 +749,26 @@ class KnobTrainer:
             if cal_records:
                 print(f"\n[Warm-Start] Enqueuing {len(cal_records)} Real Judge calibration run(s) as anchor trials:")
                 for rec in cal_records:
+<<<<<<< Updated upstream
                     print(f"  -> Enqueued {rec.name:<22} (Real Score: {rec.real_score:.4f})")
                     study.enqueue_trial(rec.knobs)
                     self.elite_pool.add(rec.knobs, 0.0, 0.0, -1)
                 best_cal = cal_records[0].knobs
+=======
+                    clean_knobs = {k: rec.knobs.get(k, DEFAULT_KNOBS[k]) for k in KNOB_SPECS}
+                    print(f"  -> Enqueued {rec.name:<22} (Real Score: {rec.real_score:.4f})")
+                    study.enqueue_trial(clean_knobs)
+                    self.elite_pool.add(clean_knobs, 0.0, 0.0, -1)
+                best_cal = {k: cal_records[0].knobs.get(k, DEFAULT_KNOBS[k]) for k in KNOB_SPECS}
+>>>>>>> Stashed changes
             else:
                 best_cal = DEFAULT_KNOBS
 
             # Evaluate top baseline on val set
+<<<<<<< Updated upstream
+=======
+            print("[Baseline] Evaluating initial anchor knobs on validation set...")
+>>>>>>> Stashed changes
             val_base, _, v_val, v_tot = self.evaluate_dataset(self.val_path, best_cal)
             self.champion_val_score = val_base
             self.champion_effective_val = val_base * (v_val / max(v_tot, 1))
@@ -692,6 +788,7 @@ class KnobTrainer:
             nonlocal window_candidates
 
             # -------------------- Phase Transition State Machine --------------------
+<<<<<<< Updated upstream
             trials_since_promotion = trial.number - self.last_promotion_trial
 
             if trials_since_promotion >= self.stagnation_window:
@@ -701,29 +798,72 @@ class KnobTrainer:
                     self.current_phase = "CMAES_REFINE"
                     self.phase_start_trial = trial.number
                     self.last_promotion_trial = trial.number  # Reset counter for CMA-ES phase
+=======
+            is_final_cooldown = (trial.number >= int(n_trials * 0.90))
+            trials_since_promotion = trial.number - self.last_promotion_trial
+
+            if is_final_cooldown and self.current_phase != "FINAL_ANNEAL":
+                print(f"\n>>> [Phase Shift] Entering Final 10% Precision Cooldown Phase ({trial.number}/{n_trials}). Annealing step-sizes for local optimum lock-in...")
+                self.current_phase = "FINAL_ANNEAL"
+                self.phase_start_trial = trial.number
+                self.last_promotion_trial = trial.number
+                fine_cma = CmaEsSampler(
+                    seed=self.seed + trial.number * 17,
+                    n_startup_trials=0,
+                    with_margin=False,
+                    restart_strategy=None,
+                    inc_popsize=1,
+                )
+                study.sampler = fine_cma
+                study.enqueue_trial(self.champion_knobs)
+                for elite in self.elite_pool.get_top(3):
+                    study.enqueue_trial(mutate_knobs(elite["knobs"], scale=0.03, discrete_flip_prob=0.05, rng=self.rng))
+
+            elif not is_final_cooldown and trials_since_promotion >= self.stagnation_window:
+                if self.current_phase == "TPE_GLOBAL":
+                    # Transition: TPE -> High-Variance IPOP CMA-ES (10-20x aggressive exploration step)
+                    print(f"\n>>> [Phase Shift] Stagnation ({trials_since_promotion} trials). Launching Aggressive IPOP CMA-ES Exploration (boosted step-size)...")
+                    self.current_phase = "CMAES_REFINE"
+                    self.phase_start_trial = trial.number
+                    self.last_promotion_trial = trial.number
+>>>>>>> Stashed changes
 
                     cma_sampler = CmaEsSampler(
                         seed=self.seed + trial.number,
                         n_startup_trials=0,
                         with_margin=True,
                         restart_strategy="ipop",
+<<<<<<< Updated upstream
                         inc_popsize=2,
+=======
+                        inc_popsize=3,
+>>>>>>> Stashed changes
                     )
                     study.sampler = cma_sampler
                     study.enqueue_trial(self.champion_knobs)
 
                 elif self.current_phase == "CMAES_REFINE":
+<<<<<<< Updated upstream
                     # Transition: CMA-ES -> Elite Mutation & Basin Jumps
                     print(f"\n>>> [Phase Shift] CMA-ES converged without promotion. Injecting Multi-Scale Elite Mutations & Basin Jumps...")
+=======
+                    # Transition: CMA-ES -> Fearless Multi-Scale Elite Mutations & Deep Basin Jumps
+                    print(f"\n>>> [Phase Shift] Injecting Fearless 10-20x Multi-Scale Elite Mutations & Deep Basin Jumps...")
+>>>>>>> Stashed changes
                     self.current_phase = "ELITE_MUTATE"
                     self.phase_start_trial = trial.number
                     self.last_promotion_trial = trial.number
 
+<<<<<<< Updated upstream
                     # Enqueue multi-scale mutations around top elites
+=======
+                    # Enqueue multi-scale mutations around top elites with boosted exploration
+>>>>>>> Stashed changes
                     elites = self.elite_pool.get_top(5)
                     seeds_to_mutate = [e["knobs"] for e in elites] if elites else [self.champion_knobs]
 
                     mutant_count = 0
+<<<<<<< Updated upstream
                     # Fine perturbations (sigma = 0.05)
                     for base in seeds_to_mutate[:3]:
                         study.enqueue_trial(mutate_knobs(base, scale=0.05, discrete_flip_prob=0.10, rng=self.rng))
@@ -738,6 +878,22 @@ class KnobTrainer:
                         mutant_count += 1
 
                     print(f"    Injected {mutant_count} multi-scale mutant candidates into optimization queue.")
+=======
+                    # Medium-large perturbations (sigma = 0.25)
+                    for base in seeds_to_mutate[:3]:
+                        study.enqueue_trial(mutate_knobs(base, scale=0.25, discrete_flip_prob=0.20, rng=self.rng))
+                        mutant_count += 1
+                    # Aggressive wide perturbations (sigma = 0.55, 10x standard step)
+                    for base in seeds_to_mutate:
+                        study.enqueue_trial(mutate_knobs(base, scale=0.55, discrete_flip_prob=0.35, rng=self.rng))
+                        mutant_count += 1
+                    # Fearless deep basin jumps (sigma = 0.90, 20x standard step)
+                    for base in seeds_to_mutate[:3]:
+                        study.enqueue_trial(mutate_knobs(base, scale=0.90, discrete_flip_prob=0.50, rng=self.rng))
+                        mutant_count += 1
+
+                    print(f"    Injected {mutant_count} high-magnitude mutant candidates into optimization queue.")
+>>>>>>> Stashed changes
 
                 elif self.current_phase == "ELITE_MUTATE":
                     # Transition: Elite Mutation -> TPE Recycle
@@ -780,6 +936,10 @@ class KnobTrainer:
                 "TPE_GLOBAL": "TPE-Multi",
                 "CMAES_REFINE": "CMA-IPOP",
                 "ELITE_MUTATE": "Elite-Mut",
+<<<<<<< Updated upstream
+=======
+                "FINAL_ANNEAL": "Anneal-Fine",
+>>>>>>> Stashed changes
             }
             tag = phase_tags.get(self.current_phase, "TPE")
             status_tag = f"Valid: {valid_cnt}/{total}" if valid_cnt == total else f"INVALID: {total - valid_cnt}/{total}"
@@ -860,7 +1020,11 @@ def main():
     parser.add_argument("--val-every", type=int, default=10, help="Evaluate champion on val set every M trials (default: 10).")
     parser.add_argument("--startup-ratio", type=float, default=0.15, help="Fraction of trials allocated to random startup exploration (default: 0.15 = 15%%).")
     parser.add_argument("--stagnation-ratio", type=float, default=0.06, help="Fraction of trials without improvement before phase shift (default: 0.06 = 6%%).")
+<<<<<<< Updated upstream
     parser.add_argument("--fitness-mode", type=str, default="avg_only", choices=["avg_only", "power_mean", "soft_min"], help="Fitness calculation formulation (default: avg_only).")
+=======
+    parser.add_argument("--fitness-mode", type=str, default="power_mean", choices=["avg_only", "power_mean", "soft_min", "tail_risk"], help="Fitness calculation formulation (default: power_mean).")
+>>>>>>> Stashed changes
     parser.add_argument("--alpha", type=float, default=0.70, help="Weight on overall mean score in fitness (default: 0.70).")
     parser.add_argument("--power", type=float, default=0.50, help="Exponent p for generalized power-mean floor metric (default: 0.50).")
     parser.add_argument("--study-name", type=str, default="study", help="Optuna study name.")

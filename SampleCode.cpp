@@ -7,10 +7,15 @@
 #include <vector>
 #include <map>
 #include <iostream>
+<<<<<<< Updated upstream
+=======
+#include <string>
+>>>>>>> Stashed changes
 
 using namespace std;
 
 // ==============================================================================
+<<<<<<< Updated upstream
 // Configuration & Knobs
 // ==============================================================================
 static double envd(const char *n, double d) { const char *s = getenv(n); return s ? atof(s) : d; }
@@ -72,6 +77,72 @@ static void loadKnobs() {
     KN_HOLD_ACT       = envi("V4_HOLD_ACT", 1);
     KN_HOLD_AW        = envd("V4_HOLD_AW", 0.9263480306);
     KN_WAVE_CAPS_BATCH = envi("V4_WAVE_CAPS_BATCH", 0);
+=======
+// Tuning Knobs per Mathematics.md (§Algorithmic Workflow Parameters)
+// ==============================================================================
+struct TuningKnobs {
+    double W1 = 6.806004019032381;  // weight of S in beta
+    double W2 = 9.91138845650093;  // weight of normalized throughput weight in beta
+    double W3 = 0.10888201654352386;  // weight of SLO2 in beta
+    double B1 = 14.552964640809979;  // bias in beta
+    double W4 = 1.6025810155559634;  // weight of SLO2 in tau
+    double W5 = 1.9209793002118332;  // weight of latency in tau
+    double B2 = 6.35782882757335;  // bias in tau
+    double W6 = 16.125831260654476;  // weight of (L_in / 1000) in gamma
+    double B3 = 4.201778407952444;  // bias in gamma
+    double URG_SCALE = 16.116441930697253; // urgency multiplier
+};
+
+static TuningKnobs g_knobs;
+
+static void parseTuningArgs(int argc = 0, char* argv[] = nullptr) {
+    auto getEnvD = [](const char* name, double def) {
+        const char* val = getenv(name);
+        return val ? atof(val) : def;
+    };
+    auto envd = [](const char* name, double def) {
+        const char* val = getenv(name);
+        return val ? atof(val) : def;
+    };
+    g_knobs.W1 = getEnvD("W1", envd("V4_W1", 6.806004019032381));
+    g_knobs.W2 = getEnvD("W2", envd("V4_W2", 9.91138845650093));
+    g_knobs.W3 = getEnvD("W3", envd("V4_W3", 0.10888201654352386));
+    g_knobs.B1 = getEnvD("B1", envd("V4_B1", 14.552964640809979));
+    g_knobs.W4 = getEnvD("W4", envd("V4_W4", 1.6025810155559634));
+    g_knobs.W5 = getEnvD("W5", envd("V4_W5", 1.9209793002118332));
+    g_knobs.B2 = getEnvD("B2", envd("V4_B2", 6.35782882757335));
+    g_knobs.W6 = getEnvD("W6", envd("V4_W6", 16.125831260654476));
+    g_knobs.B3 = getEnvD("B3", envd("V4_B3", 4.201778407952444));
+    g_knobs.URG_SCALE = getEnvD("URG_SCALE", envd("V4_URG_SCALE", 16.116441930697253));
+
+    if (argv && argc >= 10) {
+        g_knobs.W1 = atof(argv[1]);
+        g_knobs.W2 = atof(argv[2]);
+        g_knobs.W3 = atof(argv[3]);
+        g_knobs.B1 = atof(argv[4]);
+        g_knobs.W4 = atof(argv[5]);
+        g_knobs.W5 = atof(argv[6]);
+        g_knobs.B2 = atof(argv[7]);
+        g_knobs.W6 = atof(argv[8]);
+        g_knobs.B3 = atof(argv[9]);
+        if (argc >= 11) g_knobs.URG_SCALE = atof(argv[10]);
+    } else if (argv) {
+        for (int i = 1; i + 1 < argc; i += 2) {
+            string flag = argv[i];
+            double val = atof(argv[i + 1]);
+            if (flag == "--w1" || flag == "--W1") g_knobs.W1 = val;
+            else if (flag == "--w2" || flag == "--W2") g_knobs.W2 = val;
+            else if (flag == "--w3" || flag == "--W3") g_knobs.W3 = val;
+            else if (flag == "--b1" || flag == "--B1") g_knobs.B1 = val;
+            else if (flag == "--w4" || flag == "--W4") g_knobs.W4 = val;
+            else if (flag == "--w5" || flag == "--W5") g_knobs.W5 = val;
+            else if (flag == "--b2" || flag == "--B2") g_knobs.B2 = val;
+            else if (flag == "--w6" || flag == "--W6") g_knobs.W6 = val;
+            else if (flag == "--b3" || flag == "--B3") g_knobs.B3 = val;
+            else if (flag == "--urg" || flag == "--URG_SCALE") g_knobs.URG_SCALE = val;
+        }
+    }
+>>>>>>> Stashed changes
 }
 
 // ==============================================================================
@@ -112,7 +183,11 @@ struct RateOptimizer {
             maxRate = max(maxRate, bp[i].second);
         }
         gMinEff = 1;
+<<<<<<< Updated upstream
         for (auto &p : bp) { if (p.second >= KN_RATE_EFF * maxRate) { gMinEff = max(1, (int)p.first); break; } }
+=======
+        for (auto &p : bp) { if (p.second >= 0.15 * maxRate) { gMinEff = max(1, (int)p.first); break; } }
+>>>>>>> Stashed changes
     }
 
     int bestSize(int n) const {
@@ -235,7 +310,11 @@ static inline int drain(Ring &q, St want, int cap) {
 }
 
 // ==============================================================================
+<<<<<<< Updated upstream
 // Pressures & Heuristics
+=======
+// Pressures & Mathematical Helpers (§Algorithmic Workflow Parameters)
+>>>>>>> Stashed changes
 // ==============================================================================
 static inline double projTdrMean(double t) { return (cntArr == 0) ? 0 : (tdrSum + (cntNotPPost * t - sumArrNotPPost)) / (double)cntArr; }
 static inline double projTpotMean() { long c = cntTpotDone + cntTpotAct; return c ? (sumTpotDone + sumTpotAct) / (double)c : 0; }
@@ -243,6 +322,7 @@ static inline void recomputePressures(double t) {
     gProjTdr = projTdrMean(t); gProjTpot = projTpotMean();
     cHopeless = (distBase <= 0.0) && (gProjTdr > 2.0 * SLO1 || gProjTpot > 2.0 * SLO2);
     bool cOff = (wC <= 1e-12) || cHopeless;
+<<<<<<< Updated upstream
     tdrPressure  = (cOff || slo1Free) ? 0.0 : min(1.5, gProjTdr / SLO1);
     tpotPressure = (cOff || slo2Free) ? 0.0 : min(1.5, gProjTpot / SLO2);
 }
@@ -267,12 +347,36 @@ static inline double ageD(double w) {
 static inline double ageP(double w) {
     double r = w / SLO1; if (r > 5) r = 5 + log1p(r - 5);
     return (KN_AGE_NORM ? (w / SLO1) : w) * (KN_AGE_FLOOR + KN_AGE_AW * (1.0 - awEff()) + KN_AGE_PRESS * tdrPressure) + KN_AGE_SLO_W * r;
+=======
+    tdrPressure  = (cOff || slo1Free) ? 0.0 : min(1.5, max(0.0, (gProjTdr - SLO1) / SLO1));
+    tpotPressure = (cOff || slo2Free) ? 0.0 : min(1.5, max(0.0, (gProjTpot - SLO2) / SLO2));
+}
+static inline double awEff() { return cHopeless ? 1.0 : aw; }
+static inline bool latDominant() { return 3.0 * latMs > (S + T_decode_proc.at((double)max(1, activeDecTotal))); }
+static inline int cloudsInUse() { int u = 0; for (int k = 0; k < K; ++k) if (activeDec[k] > 0) u++; return max(1, u); }
+
+static inline double ageD(double w) {
+    double r = w / max(1e-6, SLO2);
+    // Super-linear convex penalty: steep acceleration when latency exceeds SLO
+    double penalty = (r > 1.0) ? (r + 2.0 * (r - 1.0) * (r - 1.0)) : r;
+    return penalty * (1.0 + tpotPressure);
+}
+static inline double ageP(double w) {
+    double r = w / max(1e-6, SLO1);
+    // Super-linear convex penalty: steep acceleration when latency exceeds SLO
+    double penalty = (r > 1.0) ? (r + 2.0 * (r - 1.0) * (r - 1.0)) : r;
+    return penalty * (1.0 + tdrPressure);
+>>>>>>> Stashed changes
 }
 
 static inline int oldestPend() { trim(pendRing, PEND_PPRE); return pendRing.empty() ? -1 : pendRing.front(); }
 static inline int pickPPRE(double t) {
     int old = oldestPend(); if (old < 0) return -1;
+<<<<<<< Updated upstream
     if (!KN_SPT || t - arrOf[old] > max(3.0 * SLO1, 200.0 * S)) return old;
+=======
+    if (t - arrOf[old] > max(3.0 * SLO1, 200.0 * S)) return old;
+>>>>>>> Stashed changes
     while (!pendByLin.empty()) {
         auto it = pendByLin.begin();
         if (st[it->second] == PEND_PPRE) return it->second;
@@ -290,6 +394,7 @@ static inline int pickPref(int k) {
     return -1;
 }
 
+<<<<<<< Updated upstream
 static inline bool holdActive() {
     if (KN_HOLD == 0) return false;
     if (KN_HOLD == 1) return true;
@@ -315,6 +420,59 @@ static inline bool holdSatisfied(double t, Ring &q, St want, int nReady, int tar
     if (!q.empty()) {
         double wcap = (slo2Free || awEff() > 0.9) ? KN_HOLD_SMULT * S : max(2.0 * S, min(KN_HOLD_WFRAC * SLO2, KN_HOLD_SMULT * S));
         if (t - q.frontTs() >= wcap) return true;
+=======
+// -----------------------------------------------------------------------------
+// Dynamic Beta Batch Target & Tau Time-To-Live Functions (§Algorithmic Workflow)
+// -----------------------------------------------------------------------------
+static inline int computeBetaBatchTarget(int readyCount, const RateOptimizer& ro) {
+    if (readyCount <= 1) return 1;
+
+    int rBest = ro.bestSize(readyCount);
+    if (rBest <= 1) return 1;
+
+    double tp_ratio = wTp / (1.0 - wTp + 0.05);
+
+    // Continuous formulation: when w_tp = 0, batching incentive is zero (beta = 1)
+    // As w_tp increases, beta scales smoothly with schedule cost S and throughput demand
+    double b_target = 1.0 + tp_ratio * max(0.0, g_knobs.W1 * S + g_knobs.W2 - g_knobs.W3 * min(100.0, SLO2) + g_knobs.B1);
+    if (tpotPressure > 0.2) {
+        b_target = max(1.0, b_target - 2.0 * tpotPressure);
+    }
+
+    int beta = max(1, (int)floor(b_target));
+    beta = min(beta, rBest);
+
+    // Physical feasibility check: do not batch so many that S + decode_proc(m) exceeds SLO2
+    int maxFeasibleBatch = readyCount;
+    for (int m = 1; m <= readyCount; m++) {
+        double dproc = T_decode_proc.at((double)m);
+        if (dproc > 0.0 && S + dproc > 0.95 * SLO2) {
+            maxFeasibleBatch = max(1, m - 1);
+            break;
+        }
+    }
+
+    int target = min(readyCount, min(beta, maxFeasibleBatch));
+    return max(1, target);
+}
+
+static inline double computeTauTimeToLive() {
+    // Continuous formulation: when w_tp = 0, timeout tau = 0 (immediate dispatch, zero artificial delay)
+    // As w_tp increases, tau scales smoothly with latency and deadline
+    double tau = wTp * max(0.0, g_knobs.W4 * SLO2 + g_knobs.W5 * latMs + g_knobs.B2);
+    if (tpotPressure > 0.1) {
+        tau *= 0.5;
+    }
+    return max(0.0, tau);
+}
+
+static inline bool holdSatisfied(double t, Ring &q, St want, int nReady, int target, double tau) {
+    if (nReady >= target) return true;
+    trim(q, want);
+    if (!q.empty()) {
+        if (t - q.frontTs() >= tau) return true;
+        return false;
+>>>>>>> Stashed changes
     }
     return false;
 }
@@ -322,14 +480,22 @@ static inline bool holdSatisfied(double t, Ring &q, St want, int nReady, int tar
 static inline bool gateOK(double t) {
     if (activeDecTotal == 0) return true;
     int old = oldestPend();
+<<<<<<< Updated upstream
     if (old >= 0 && t - arrOf[old] > KN_GATE_TDR * SLO1 && !slo1Free) return true;
     if (awEff() >= 0.7 || (slo2Free && slo1Free)) return prefUpQueued < KN_UPPRE_MAX_TP;
     if (prefUpQueued >= KN_UPPRE_MAX) return false;
     return max(0.0, upFreeAt - t) <= KN_UPGATE_FRAC * max(SLO2, 8.0 * latMs);
+=======
+    if (old >= 0 && t - arrOf[old] > 1.5 * SLO1 && !slo1Free) return true;
+    if (awEff() >= 0.7 || (slo2Free && slo1Free)) return prefUpQueued < 16;
+    if (prefUpQueued >= 8) return false;
+    return max(0.0, upFreeAt - t) <= max(0.35 * SLO2, 4.0 * latMs);
+>>>>>>> Stashed changes
 }
 
 static inline int bestRemote(double t) {
     double decCost = R_dproc.perItemCost();
+<<<<<<< Updated upstream
     double consPen[8] = {0};
     
     if (KN_CONS && K > 1 && latDominant()) {
@@ -363,6 +529,13 @@ static inline int bestRemote(double t) {
                   + KN_DECW * activeDec[k] * decCost * max(4.0, 0.5 * avgLoutEst())
                   + decQ + consPen[k] + netCollisionPenalty;
                   
+=======
+    int best = 0; double bestSc = 1e300;
+    for (int k = 0; k < K; ++k) {
+        double avail = max(0.0, busyUntil[k] - t);
+        double decBacklog = (double)(dprocReady[k].size() + decUpInflight[k]) * (S + T_decode_proc.at(1.0));
+        double sc = prefBacklogMs[k] + avail + 2.0 * (double)activeDec[k] * decCost + decBacklog;
+>>>>>>> Stashed changes
         if (sc < bestSc) { bestSc = sc; best = k; }
     }
     return best;
@@ -370,6 +543,7 @@ static inline int bestRemote(double t) {
 
 static inline int pieceEnd(int rid, int k) {
     int ls = layersDone[rid], L = numLayers, lrem = L - ls;
+<<<<<<< Updated upstream
     if (!KN_CHUNK || L <= 1 || lrem <= 1) return L;
     bool decodeBlocked = dprocReady[k].size() > 0 || decUpInflight[k] > 0 || (KN_CHUNK_PRED && activeDec[k] > 0);
     if (!decodeBlocked || slo2Free || wC <= 1e-12 || cHopeless) return L;
@@ -383,6 +557,26 @@ static inline int pieceEnd(int rid, int k) {
     double G = max(KN_CHUNK_SMULT * S, 0.25 * SLO2);
     if (remaining <= 1.6 * G) return L;
     
+=======
+    if (L <= 1 || lrem <= 1) return L;
+
+    // Only chunk if decode is actually waiting or active on this specific cloud
+    bool decodeBlocked = dprocReady[k].size() > 0 || decUpInflight[k] > 0 || (activeDec[k] > 0);
+    if (!decodeBlocked || wC <= 1e-12) return L;
+
+    // If prefill delay (TDR) is worse than decode delay (TPOT), do not chunk prefill
+    double tpotRel = max(0.0, gProjTpot / max(1e-6, SLO2) - 1.0);
+    double tdrRel  = max(0.0, gProjTdr  / max(1e-6, SLO1) - 1.0);
+    if (tpotRel <= tdrRel) return L;
+
+    double remaining = (double)lrem / (double)L * fullProcDur[rid];
+    if (remaining <= max(4.0 * S, 0.5 * SLO2)) return L;
+
+    // Chunk size G based on mathematical knob formulation
+    double G = max(g_knobs.W6 * S, 0.25 * SLO2);
+    if (remaining <= 1.5 * G) return L;
+
+>>>>>>> Stashed changes
     int p = max(1, min((int)llround((double)lrem * G / remaining), lrem));
     return ls + p;
 }
@@ -409,7 +603,12 @@ double evaluate_sim_state(const LocalSimState& s) {
     double projTpot = c ? (s.sumTpotDone + s.sumTpotAct) / (double)c : 0;
     double tdrExcess = max(0.0, (projTdr - SLO1) / SLO1);
     double tpotExcess = max(0.0, (projTpot - SLO2) / SLO2);
+<<<<<<< Updated upstream
     return sqrt(tdrExcess * tdrExcess + tpotExcess * tpotExcess);
+=======
+    // Super-linear convex penalty: steep punishment on large deviations beyond SLO
+    return (tdrExcess + 2.0 * tdrExcess * tdrExcess) + (tpotExcess + 2.0 * tpotExcess * tpotExcess);
+>>>>>>> Stashed changes
 }
 
 double simulate_and_evaluate(LocalSimState s, const Action& a) {
@@ -431,7 +630,11 @@ double simulate_and_evaluate(LocalSimState s, const Action& a) {
         dur = S + T_prefill_pre.at(1.0); s.t += dur;
         s.upFreeAt = max(s.upFreeAt, s.t) + xferMs(linOf[a.target_rid]);
     }
+<<<<<<< Updated upstream
     return evaluate_sim_state(s) - (0.00001 * a.bid_score); 
+=======
+    return evaluate_sim_state(s) - (0.001 * a.bid_score); 
+>>>>>>> Stashed changes
 }
 
 // ==============================================================================
@@ -548,16 +751,38 @@ void run_local_engine(double t, bool force) {
     int ppost  = qPPOST.empty() ? -1 : qPPOST.front();
     int ppre   = pickPPRE(t), oldest = oldestPend();
 
+<<<<<<< Updated upstream
     bool holdOn = holdActive();
     int dpreTarget  = holdOn ? waveCap(R_dpre, activeDecTotal)  : (1 << 28);
     int dpostTarget = holdOn ? waveCap(R_dpost, activeDecTotal) : (1 << 28);
     bool dpreGo  = nDPre > 0 && (force || holdSatisfied(t, dpreReady, PEND_DPRE, nDPre, dpreTarget, true));
     bool dpostGo = nDPost > 0 && (force || holdSatisfied(t, dpostReady, PEND_DPOST, nDPost, dpostTarget, false));
+=======
+    int betaTargetDPre = computeBetaBatchTarget(nDPre, R_dpre);
+    int betaTargetDPost = computeBetaBatchTarget(nDPost, R_dpost);
+    double tau = computeTauTimeToLive();
+
+    // Fast-path immediate dispatch: If wait time of oldest item in dpreReady exceeds tau, execute immediately
+    if (!dpreReady.empty() && (t - dpreReady.frontTs() >= tau)) {
+        int cap = min(R_dpre.bestSize(nDPre), betaTargetDPre);
+        int n = drain(dpreReady, PEND_DPRE, max(1, cap));
+        if (n > 0) {
+            int len = sprintf(outBuf[na], "E D PRE -1 %d", n);
+            for (int j = 0; j < n; ++j) { len += sprintf(outBuf[na] + len, " %d", batchBuf[j]); st[batchBuf[j]] = IN_DPRE; }
+            ++na; localFree = false;
+            return;
+        }
+    }
+
+    bool dpreGo  = nDPre > 0 && (force || holdSatisfied(t, dpreReady, PEND_DPRE, nDPre, betaTargetDPre, tau));
+    bool dpostGo = nDPost > 0 && (force || holdSatisfied(t, dpostReady, PEND_DPOST, nDPost, betaTargetDPost, tau));
+>>>>>>> Stashed changes
     bool ppreGo = ppre >= 0 && (force || gateOK(t));
 
     vector<Action> legal_moves;
 
     if (dpostGo) {
+<<<<<<< Updated upstream
         int dpostCap = KN_WAVE_CAPS_BATCH ? min(R_dpost.bestSize(nDPost), dpostTarget) : R_dpost.bestSize(nDPost);
         legal_moves.push_back({A_DPOST, max(1, dpostCap), -1, -1, B_DPOST + ageD(t - dpostReady.frontTs())});
     }
@@ -569,6 +794,21 @@ void run_local_engine(double t, bool force) {
     if (ppreGo) {
         double ppreWait = min(t - arrOf[oldest >= 0 ? oldest : ppre], KN_PPRE_AGECAP);
         legal_moves.push_back({A_PPRE, 1, ppre, bestRemote(t), B_PPRE + ageP(ppreWait)});
+=======
+        int dpostCap = min(R_dpost.bestSize(nDPost), betaTargetDPost);
+        legal_moves.push_back({A_DPOST, max(1, dpostCap), -1, -1, g_knobs.URG_SCALE * ageD(t - dpostReady.frontTs())});
+    }
+    if (ppost >= 0) {
+        legal_moves.push_back({A_PPOST, 1, ppost, -1, g_knobs.URG_SCALE * ageP(t - qPPOST.frontTs())});
+    }
+    if (dpreGo) {
+        int dpreCap = min(R_dpre.bestSize(nDPre), betaTargetDPre);
+        legal_moves.push_back({A_DPRE, max(1, dpreCap), -1, -1, g_knobs.URG_SCALE * ageD(t - dpreReady.frontTs())});
+    }
+    if (ppreGo) {
+        double ppreWait = min(t - arrOf[oldest >= 0 ? oldest : ppre], 318000.0);
+        legal_moves.push_back({A_PPRE, 1, ppre, bestRemote(t), g_knobs.URG_SCALE * ageP(ppreWait)});
+>>>>>>> Stashed changes
     }
 
     if (!legal_moves.empty()) {
@@ -634,14 +874,32 @@ void run_remote_engines(double t) {
         }
 
         int nD = dprocReady[k].size(), pr = pickPref(k);
+<<<<<<< Updated upstream
         double sD = nD ? B_DPROC + ageD(t - dprocReady[k].frontTs()) : -1e300;
         double sP = pr >= 0 ? B_PPROC + ageP(t - (prefReadyRing[k].empty() ? t : prefReadyRing[k].frontTs())) : -1e300;
+=======
+        double sD = nD ? g_knobs.URG_SCALE * ageD(t - dprocReady[k].frontTs()) : -1e300;
+        double sP = pr >= 0 ? g_knobs.URG_SCALE * ageP(t - arrOf[pr]) : -1e300;
+>>>>>>> Stashed changes
         
         if (sD <= -1e299 && sP <= -1e299) continue;
 
         if (sD >= sP) {
+<<<<<<< Updated upstream
             int cap = R_dproc.bestSize(nD);
             if (KN_WAVES_PROC) cap = min(cap, max(waveCap(R_dproc, activeDec[k]), 1));
+=======
+            int maxFeasibleDProc = nD;
+            for (int m = 1; m <= nD; m++) {
+                double dproc = T_decode_proc.at((double)m);
+                if (dproc > 0.0 && S + dproc > 0.95 * SLO2) {
+                    maxFeasibleDProc = max(1, m - 1);
+                    break;
+                }
+            }
+            int cap = min(R_dproc.bestSize(nD), maxFeasibleDProc);
+            if (wTp <= 0.05) cap = 1;
+>>>>>>> Stashed changes
             int n = drain(dprocReady[k], PEND_DPROC, max(1, cap));
             if (n > 0) {
                 int len = sprintf(outBuf[na], "C%d D PROC %d %d", k, k, n);
@@ -695,11 +953,19 @@ bool setup_initial_state() {
 // ==============================================================================
 // Main Loop
 // ==============================================================================
+<<<<<<< Updated upstream
 int main() {
     ios_base::sync_with_stdio(false);
     cin.tie(nullptr);
     
     loadKnobs();
+=======
+int main(int argc, char* argv[]) {
+    ios_base::sync_with_stdio(false);
+    cin.tie(nullptr);
+    
+    parseTuningArgs(argc, argv);
+>>>>>>> Stashed changes
     if (!setup_initial_state()) return 0;
 
     double t; int e;
