@@ -81,7 +81,7 @@ Every request $i$ with input length $L_{\mathrm{in}}[i]$ and hidden output lengt
 
 ### 1. Input Stage (Prefill — Token-Free Setup)
 1. **`P PRE <remote> <rid>`** (Local Edge): Binds request $i$ to a chosen cloud worker $k \in [0, K)$. Automatically enqueues an uplink transfer carrying $L_{\mathrm{in}}[i]$ tokens upon completion.
-2. **`P PROC <ls> <le> <remote> <rid>`** (Remote Cloud): Computes layers $[ls, le) \subseteq [0, \text{num\_layers})$. Can be executed as one contiguous piece or split across multiple non-overlapping slices. The final slice ($le = \text{num\_layers}$) automatically enqueues a downlink transfer of size $L_{\mathrm{in}}[i]$.
+2. **`P PROC <ls> <le> <remote> <rid>`** (Remote Cloud): Computes layers $[ls, le) \subseteq [0, N_{\mathrm{layers}})$, where $N_{\mathrm{layers}}$ is `num_layers`. Can be executed as one contiguous piece or split across multiple non-overlapping slices. The final slice ($le = N_{\mathrm{layers}}$) automatically enqueues a downlink transfer of size $L_{\mathrm{in}}[i]$.
 3. **`P POST <remote> <rid>`** (Local Edge): Finalizes the input stage. Marks the end of **Time to Decode Ready (TDR)** and readies the request for token generation.
 
 ### 2. Output Stage (Decode — Repeated $L_{\mathrm{out}}[i]$ Times)
@@ -98,10 +98,10 @@ The scheduling strategy is formally derived in [`Mathematics.md`](Mathematics.md
 ### 1. Max-Plus Task Completion Dynamics
 For any compute task $v$ scheduled on resource $\rho(v) \in \{E, C_0, \dots, C_{K-1}\}$:
 
-$$C_v = \max\left(A_v,\; \max_{u \in \operatorname{Pred}(v)} C_u,\; R_{\rho(v)}\right) + S + d_v$$
+$$C_v = \max\left(A_v,\; \max_{u \in \mathrm{Pred}(v)} C_u,\; R_{\rho(v)}\right) + S + d_v$$
 
 - $A_v$: Decision timestamp (frame arrival time).
-- $\operatorname{Pred}(v)$: Set of formal prerequisite events (`ARR`, `TDN`, `XDN`).
+- $\mathrm{Pred}(v)$: Set of formal prerequisite events (`ARR`, `TDN`, `XDN`).
 - $R_{\rho(v)}$: Next available time of the physical execution unit.
 - $S$: Fixed scheduling cost overhead ($1 \le S \le 10\text{ ms}$).
 - $d_v$: Non-preemptive execution duration interpolated from the task-time table.
@@ -122,7 +122,7 @@ where:
 ### 3. Dynamic Decode Batching (Beta-Target & Tau-Holding Policy)
 Decode efficiency is maximized by adaptively balancing schedule overhead $S$ against latency targets:
 
-$$\beta = \operatorname{clamp}\left(\left\lfloor W_1 \cdot S + W_2 \cdot \frac{w_{\mathrm{tp}}}{w_{\mathrm{tp}} + w_c} - W_3 \cdot \mathrm{SLO}_2 + B_1 \right\rfloor,\; 1,\; \mathrm{batch}_{\max}\right)$$
+$$\beta = \mathrm{clamp}\left(\left\lfloor W_1 \cdot S + W_2 \cdot \frac{w_{\mathrm{tp}}}{w_{\mathrm{tp}} + w_c} - W_3 \cdot \mathrm{SLO}_2 + B_1 \right\rfloor,\; 1,\; \mathrm{batch}_{\max}\right)$$
 
 $$\tau = \max\left(0,\; W_4 \cdot \mathrm{SLO}_2 - W_5 \cdot \text{latency} + B_2\right)$$
 
@@ -132,7 +132,7 @@ $$\tau = \max\left(0,\; W_4 \cdot \mathrm{SLO}_2 - W_5 \cdot \text{latency} + B_
 ### 4. Adaptive Prefill Chunking (Gamma-Policy)
 Prefill operations on long sequences are split into $\gamma$ chunks to prevent head-of-line blocking on cloud workers:
 
-$$\gamma = \operatorname{clamp}\left(\left\lfloor W_6 \cdot \frac{L_{\mathrm{in}}[i]}{1000} + B_3 \right\rfloor,\; 1,\; N_{\mathrm{layers}}\right)$$
+$$\gamma = \mathrm{clamp}\left(\left\lfloor W_6 \cdot \frac{L_{\mathrm{in}}[i]}{1000} + B_3 \right\rfloor,\; 1,\; N_{\mathrm{layers}}\right)$$
 
 where $N_{\mathrm{layers}}$ is the total number of layers (`num_layers`).
 
@@ -467,7 +467,7 @@ The scheduler's decision thresholds are parameterized by 10 mathematical knobs i
 
 The official evaluation assigns a normalized score in $[0, 1000]$ per test case:
 
-$$\mathrm{Score} = 1000 \cdot \left[ w_{\mathrm{tp}} \cdot \operatorname{clamp}\left(tp;\; tp_{\mathrm{base}},\, tp_{\mathrm{UB}}\right) + w_c \cdot \operatorname{clamp}\left(dist;\; dist_{\mathrm{base}},\, 0\right) \right]$$
+$$\mathrm{Score} = 1000 \cdot \left[ w_{\mathrm{tp}} \cdot \mathrm{clamp}\left(tp;\; tp_{\mathrm{base}},\, tp_{\mathrm{UB}}\right) + w_c \cdot \mathrm{clamp}\left(dist;\; dist_{\mathrm{base}},\, 0\right) \right]$$
 
 ### 1. Throughput Component
 $$tp = \frac{\sum_{i=0}^{R-1} L_{\mathrm{out}}[i]}{\max_i(\mathrm{FinalToken}_i) - \min_i(\mathrm{Arrival}_i)} \quad (\text{tokens/ms})$$
