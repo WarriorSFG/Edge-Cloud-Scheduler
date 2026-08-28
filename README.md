@@ -93,7 +93,7 @@ Every request $i$ with input length $L_{\mathrm{in}}[i]$ and hidden output lengt
 
 ## 📐 Mathematical Foundation & Optimization Theory
 
-The scheduling strategy is formally derived in [`Mathematics.md`](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Mathematics.md) and governed by the following mathematical primitives:
+The scheduling strategy is formally derived in [`Mathematics.md`](Mathematics.md) and governed by the following mathematical primitives:
 
 ### 1. Max-Plus Task Completion Dynamics
 For any compute task $v$ scheduled on resource $\rho(v) \in \{E, C_0, \dots, C_{K-1}\}$:
@@ -206,7 +206,7 @@ flowchart TD
 
 ### 1. Calibrated Workload Generator (`Generator.py`)
 
-[Generator.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Code/Generator.py) creates mathematically rigorous, diverse test cases across **19 distinct stress-test profiles**.
+[Generator.py](Code/Generator.py) creates mathematically rigorous, diverse test cases across **19 distinct stress-test profiles**.
 
 #### Key Features:
 - **Zero-Score Elimination**: Re-generates any test case that fails or produces 0 points under any known baseline weights.
@@ -236,7 +236,7 @@ python Code/Generator.py 20 -p network_bottleneck -o Testcases/Raw/net_bottlenec
 
 ### 2. Multi-Threaded Discrete-Event Simulator (`Simulator.py` / `Simulator.cpp`)
 
-The simulation engine is written in performance-tuned C++ ([Simulator.cpp](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Code/Simulator.cpp)) with multi-core OpenMP parallelization, orchestrated through a flexible Python interface ([Simulator.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Code/Simulator.py)).
+The simulation engine is written in performance-tuned C++ ([Simulator.cpp](Code/Simulator.cpp)) with multi-core OpenMP parallelization, orchestrated through a flexible Python interface ([Simulator.py](Code/Simulator.py)).
 
 #### Key Features:
 - **100% Protocol Fidelity**: Simulates full interactive event frames (`ARR`, `TDN`, `XDN`, `FIN`), piecewise interpolation, and exact score clamping.
@@ -269,7 +269,7 @@ python Code/Simulator.py Testcases/Train/holdout.jsonl -r 100
 
 ### 3. Autonomous Black-Box Hyperparameter Trainer (`Trainer.py`)
 
-[Trainer.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Code/Trainer.py) uses **Optuna** and **CMA-ES** to discover globally optimal configurations for the mathematical knobs in [`KnobSet`](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Schedulers/Scheduler.h#L18).
+[Trainer.py](Code/Trainer.py) uses **Optuna** and **CMA-ES** to discover globally optimal configurations for the mathematical knobs in [`KnobSet`](Schedulers/Scheduler.h#L18).
 
 #### Key Architecture:
 - **Cyclic Multi-Phase Search**:
@@ -334,7 +334,7 @@ Supported formats inside `Calibration/`:
 
 ### 5. Automated Submission Patcher (`Patcher.py`)
 
-[Patcher.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Patcher/Patcher.py) reads champion parameters from `.env` files and injects them directly into standalone C++ source files for competition submission.
+[Patcher.py](Patcher/Patcher.py) reads champion parameters from `.env` files and injects them directly into standalone C++ source files for competition submission.
 
 #### CLI Arguments:
 | Argument | Flag | Type | Default | Description |
@@ -358,7 +358,7 @@ python Patcher/Patcher.py -e Artifacts/champion.env -c Patcher/Submission.cpp --
 
 ### 6. C++ Knob Extraction Utilities (`cpp_to_json.py`)
 
-[cpp_to_json.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Ultility/cpp_to_json.py) parses C++ source code, header declarations, or console snippets and exports standardized JSON calibration objects.
+[cpp_to_json.py](Ultility/cpp_to_json.py) parses C++ source code, header declarations, or console snippets and exports standardized JSON calibration objects.
 
 ```bash
 # Extract parameters from source file
@@ -418,7 +418,7 @@ python Patcher/Patcher.py -e Artifacts/champion.env -c Patcher/Submission.cpp -o
 
 ## 🧪 19 Stress-Test Profiles
 
-To ensure robust generalization, [Generator.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Code/Generator.py) tests the scheduler across 19 adversarial workload regimes:
+To ensure robust generalization, [Generator.py](Code/Generator.py) tests the scheduler across 19 adversarial workload regimes:
 
 | Profile Name | Characteristic Dimensions | Stress Target |
 |---|---|---|
@@ -446,7 +446,7 @@ To ensure robust generalization, [Generator.py](file:///c:/Users/Samarth/Downloa
 
 ## 🎛 Mathematical Hyperparameter Knobs
 
-The scheduler's decision thresholds are parameterized by 10 mathematical knobs in [`KnobSet`](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Schedulers/Scheduler.h#L18):
+The scheduler's decision thresholds are parameterized by 10 mathematical knobs in [`KnobSet`](Schedulers/Scheduler.h#L18):
 
 | Knob Name | Description | Default Champion Value | Search Bounds |
 |---|---|---|---|
