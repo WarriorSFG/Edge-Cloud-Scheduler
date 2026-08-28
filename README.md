@@ -1,187 +1,493 @@
-# Scheduler — Code Scripts
+# ⚡ Edge-Cloud Interactive Distributed Task Scheduler
 
-## Generator.py
+An ultra-high-performance, mathematically grounded scheduling engine and autonomous optimization pipeline designed for hybrid edge-cloud distributed inference. Built to resolve complex compute-network trade-offs under rigid Service Level Objectives (SLOs), non-linear network FIFO transfer queues, and non-preemptive hardware scheduling overheads.
 
-### Script name
-`Generator.py`
+---
 
-### Script function
-Generates diverse, high-quality test cases for the Scheduler problem using **19 stress-test profiles**. Each profile targets a different scheduler dimension (e.g. network bottleneck, fast network, heavy transfer, compute bottleneck, high schedule cost, throughput-only, latency-only, balanced, topology, burst/streaming arrivals, layer splitting, and adversarial setups) to prevent overfitting while ensuring comprehensive coverage. Test cases are distributed evenly across profiles by default.
+## 📑 Table of Contents
 
-Output is written as a **JSONL** file (one JSON object per line) into `Testcases/Raw/`.
+- [Overview](#-overview)
+- [System Architecture & Lifecycle](#-system-architecture--lifecycle)
+- [Mathematical Foundation & Optimization Theory](#-mathematical-foundation--optimization-theory)
+- [Repository Structure](#-repository-structure)
+- [End-to-End Pipeline & Tooling](#-end-to-end-pipeline--tooling)
+  - [1. Calibrated Workload Generator (`Generator.py`)](#1-calibrated-workload-generator-generatorpy)
+  - [2. Multi-Threaded Discrete-Event Simulator (`Simulator.py` / `Simulator.cpp`)](#2-multi-threaded-discrete-event-simulator-simulatorpy--simulatorcpp)
+  - [3. Autonomous Black-Box Hyperparameter Trainer (`Trainer.py`)](#3-autonomous-black-box-hyperparameter-trainer-trainerpy)
+  - [4. Real Judge Calibration Suite (`Calibration/`)](#4-real-judge-calibration-suite-calibration)
+  - [5. Automated Submission Patcher (`Patcher.py`)](#5-automated-submission-patcher-patcherpy)
+  - [6. C++ Knob Extraction Utilities (`cpp_to_json.py`)](#6-c-knob-extraction-utilities-cpp_to_jsonpy)
+- [Quick Start Guide](#-quick-start-guide)
+  - [Prerequisites](#prerequisites)
+  - [Building and Running the Standalone Scheduler](#building-and-running-the-standalone-scheduler)
+  - [Running Simulations & Benchmarks](#running-simulations--benchmarks)
+  - [Optimizing Hyperparameters](#optimizing-hyperparameters)
+  - [Packaging Contest Submissions](#packaging-contest-submissions)
+- [19 Stress-Test Profiles](#-19-stress-test-profiles)
+- [Mathematical Hyperparameter Knobs](#-mathematical-hyperparameter-knobs)
+- [Scoring Formula & Metrics](#-scoring-formula--metrics)
+- [Verification & Zero-Score Safety Rules](#-verification--zero-score-safety-rules)
 
-### Arguments
+---
 
-| Argument | Type | Required | Default | Description |
-| --- | --- | --- | --- | --- |
-| `num_testcases` | `int` | **Yes** | — | Number of test cases to generate. |
-| `--output`, `-o` | `str` | No | `testcases.jsonl` | Output filename (placed inside `Testcases/Raw/`). |
-| `--seed`, `-s` | `int` | No | `None` | Random seed for reproducible generation. |
-| `--profile`, `-p` | `str` | No | `None` (mixed) | Force all test cases to use a single named profile. |
-| `--list-profiles` | flag | No | — | Print available profile names and exit. |
+## 🔭 Overview
 
-### Script usage
+The **Edge-Cloud Interactive Task Scheduler** coordinates jobs between a single local **Edge Computer** ($E$) and $K$ identical **Remote Cloud Workers** ($C_0, C_1, \dots, C_{K-1}$) connected across shared, bidirectional FIFO communication links.
 
-```bash
-# Generate 30 mixed-profile test cases (at least 1 of each profile)
-python Code/Generator.py 30
+The engine addresses a fundamental challenge in distributed systems: **maximizing throughput while simultaneously minimizing latency** under unknown streaming request arrival distributions, variable sequence lengths, and piecewise-linear compute profiles.
 
-# Generate 50 test cases with a fixed seed for reproducibility
-python Code/Generator.py 50 --seed 42
+```mermaid
+flowchart LR
+    subgraph Edge ["Local Edge Computer (E)"]
+        PPRE["P PRE (Assign Cloud & Start Prefill)"]
+        PPOST["P POST (Finalize Prefill & Mark Ready)"]
+        DPRE["D PRE (Batch Multi-Cloud Decode Requests)"]
+        DPOST["D POST (Emit Generated Token)"]
+    end
 
-# Generate 10 network-bottleneck-only test cases
-python Code/Generator.py 10 --profile network_bottleneck
+    subgraph Network ["Shared Bidirectional Network"]
+        UP["Uplink FIFO Queue (Edge -> Cloud)"]
+        DOWN["Downlink FIFO Queue (Cloud -> Edge)"]
+    end
 
-# List all available profiles
-python Code/Generator.py --list-profiles
+    subgraph Cloud ["K Remote Cloud Workers (C0 ... C_{K-1})"]
+        PPROC["P PROC (Prefill Chunk Execution [ls, le))"]
+        DPROC["D PROC (Batched Output Step Execution)"]
+    end
 
-# Custom output filename
-python Code/Generator.py 100 -o stress_batch.jsonl -s 123
+    ARR([Request Arrival ARR]) --> PPRE
+    PPRE --> UP
+    UP --> PPROC
+    PPROC --> DOWN
+    DOWN --> PPOST
+    PPOST --> DPRE
+    DPRE --> UP
+    UP --> DPROC
+    DPROC --> DOWN
+    DOWN --> DPOST
+    DPOST -->|Token Generated / Next Step| DPRE
+    DPOST -->|Final Token Emitted| FIN([Finished FIN])
 ```
 
 ---
 
-## Simulator.py / Simulator (C++)
+## 🏗 System Architecture & Lifecycle
 
-### Script name
-`Simulator.py` (CLI wrapper) / `Simulator.cpp` (OpenMP-accelerated C++ core)
+Every request $i$ with input length $L_{\text{in}}[i]$ and hidden output length $L_{\text{out}}[i]$ passes through two primary stages:
 
-### Script function
-High-performance, parallel discrete-event simulation engine that evaluates schedulers on test cases with complete fidelity to the protocol and scoring model specified in `ProblemStatement.md`.
+### 1. Input Stage (Prefill — Token-Free Setup)
+1. **`P PRE <remote> <rid>`** (Local Edge): Binds request $i$ to a chosen cloud worker $k \in [0, K)$. Automatically enqueues an uplink transfer carrying $L_{\text{in}}[i]$ tokens upon completion.
+2. **`P PROC <ls> <le> <remote> <rid>`** (Remote Cloud): Computes layers $[ls, le) \subseteq [0, \text{num\_layers})$. Can be executed as one contiguous piece or split across multiple non-overlapping slices. The final slice ($le = \text{num\_layers}$) automatically enqueues a downlink transfer of size $L_{\text{in}}[i]$.
+3. **`P POST <remote> <rid>`** (Local Edge): Finalizes the input stage. Marks the end of **Time to Decode Ready (TDR)** and readies the request for token generation.
 
-- **Faithful Simulation**: Replicates all event frames (`ARR`, `TDN`, `XDN`, `FIN`), local/remote server tracking, schedule cost $S$, piece splitting duration arithmetic, independent FIFO UP/DOWN link latency/bandwidth queues, and exact score calculation (Throughput component, TDR/TPOT waiting-time component, SLO excess calculation, and $0..1000$ scoring).
-- **Blazingly Fast Parallelism**: Multi-threaded execution via OpenMP with zero heap allocations per event in inner simulation loops, achieving hundreds to thousands of full simulations per second across CPU cores.
-- **Automatic Build**: Automatically detects and invokes C++ compilers (`g++`, `clang++`, or `cl`) with `-O3 -fopenmp` optimization flags.
+### 2. Output Stage (Decode — Repeated $L_{\text{out}}[i]$ Times)
+1. **`D PRE -1 <m> <rid...>`** (Local Edge): Batches $m \ge 1$ ready requests spanning any combination of remote servers. Automatically forks independent uplink transfers to each represented remote server (enqueued in ascending server ID order).
+2. **`D PROC <remote> <m> <rid...>`** (Remote Cloud): Executes the output step for all batch members assigned to that specific cloud worker. Enqueues a downlink transfer of size $m$.
+3. **`D POST -1 <m> <rid...>`** (Local Edge): Emits exactly one token per member. When iteration $L_{\text{out}}[i]$ completes, the interactor yields a `FIN` event, retiring the request.
 
-### Arguments
+---
 
-| Argument | Type | Required | Default | Description |
-| --- | --- | --- | --- | --- |
-| `testcases` | `str` | No | `Testcases/Raw/testcases.jsonl` | Path to JSONL testcases file. |
-| `--threads`, `-t`, `-j` | `int` | No | `0` (hardware max) | Number of parallel OpenMP worker threads. |
-| `--repeat`, `-r` | `int` | No | `1` | Number of times to repeat test suite evaluation for benchmarking. |
-| `--profile`, `-p` | `str` | No | `""` (all) | Filter testcases to evaluate only a specific profile. |
-| `--verbose`, `-v` | flag | No | `False` | Print detailed per-testcase score breakdown table. |
-| `--json` | flag | No | `False` | Output summary metrics in machine-readable JSON format. |
-| `--rebuild` | flag | No | `False` | Force recompilation of the C++ Simulator binary. |
+## 📐 Mathematical Foundation & Optimization Theory
 
-### Script usage
+The scheduling strategy is formally derived in [`Mathematics.md`](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Mathematics.md) and governed by the following mathematical primitives:
 
-```bash
-# Run simulation across all test cases with full summary report
-python Code/Simulator.py
+### 1. Max-Plus Task Completion Dynamics
+For any compute task $v$ scheduled on resource $\rho(v) \in \{E, C_0, \dots, C_{K-1}\}$:
 
-# Run with per-testcase detailed breakdown (ID, Profile, Score, TP, TDR, TPOT)
-python Code/Simulator.py -v
+$$C_v = \max\left(A_v,\; \max_{u \in \text{Pred}(v)} C_u,\; R_{\rho(v)}\right) + S + d_v$$
 
-# Run 100 benchmark iterations across all CPU cores (e.g. 3,000 simulations)
-python Code/Simulator.py -r 100
+- $A_v$: Decision timestamp (frame arrival time).
+- $\text{Pred}(v)$: Set of formal prerequisite events (`ARR`, `TDN`, `XDN`).
+- $R_{\rho(v)}$: Next available time of the physical execution unit.
+- $S$: Fixed scheduling cost overhead ($1 \le S \le 10\text{ ms}$).
+- $d_v$: Non-preemptive execution duration interpolated from the task-time table.
 
-# Filter by a specific test profile
-python Code/Simulator.py --profile burst_arrivals -v
+### 2. Dynamic FIFO Link Transfer Model
+Uplink and Downlink queues operate as independent, non-preemptive single-server FIFO channels:
 
-# Specify custom testcase file and 8 worker threads
-python Code/Simulator.py Testcases/Raw/testcases.jsonl -j 8
+$$T(\textit{len}) = \text{latency\_in\_ms} + \frac{8 \cdot \textit{len} \cdot \text{bytes\_per\_token}}{\text{bandwidth\_gbps} \cdot 10^6}$$
 
-# Output machine-readable JSON metrics
-python Code/Simulator.py --json
+$$C(Q_{\text{tail}}) = \max(A_{\text{entry}},\, Q_{\text{tail}}) + T(\textit{len})$$
 
-# Direct C++ binary execution (if preferred)
-./Code/Simulator.exe -i Testcases/Raw/testcases.jsonl -v
+### 3. Dynamic Decode Batching ($\beta$-Target & $\tau$-Holding Policy)
+Decode efficiency is maximized by adaptively balancing schedule overhead $S$ against latency targets:
+
+$$\beta = \text{clamp}\left(\left\lfloor W_1 \cdot S + W_2 \cdot \frac{w_{\text{tp}}}{w_{\text{tp}} + w_c} - W_3 \cdot \text{SLO}_2 + B_1 \right\rfloor,\; 1,\; \text{batch}_{\text{max}}\right)$$
+
+$$\tau = \max\left(0.0,\; W_4 \cdot \text{SLO}_2 - W_5 \cdot \text{latency\_in\_ms} + B_2\right)$$
+
+- If ready queue size $n \ge \beta$, the batch is dispatched immediately.
+- If $n < \beta$, the batch is held for at most $\tau$ ms, unless hold expiration or link starvation forces dispatch.
+
+### 4. Adaptive Prefill Chunking ($\gamma$-Policy)
+Prefill operations on long sequences are split into $\gamma$ chunks to prevent head-of-line blocking on cloud workers:
+
+$$\gamma = \text{clamp}\left(\left\lfloor W_6 \cdot \frac{L_{\text{in}}[i]}{1000} + B_3 \right\rfloor,\; 1,\; \text{num\_layers}\right)$$
+
+---
+
+## 📂 Repository Structure
+
+```text
+Edge-Cloud-Scheduler/
+├── Artifacts/                      # Production weights, champion configs, and training metadata
+│   ├── champion.env                # Champion hyperparameter export (.env format)
+│   └── champion.json               # Full evaluation metadata, profile breakdown, and timestamps
+├── Calibration/                    # Real-Judge benchmark logs for rank-order consistency
+│   └── Info.md                     # Calibration schema and integration guide
+├── Code/                           # Core execution engines and CLI toolchain
+│   ├── Generator.py                # Calibrated 19-profile workload generator
+│   ├── Simulator.cpp               # OpenMP-accelerated C++ discrete-event simulator core
+│   ├── Simulator.py                # Multi-threaded Python simulation CLI runner
+│   ├── Simulator.exe               # Compiled C++ simulation binary
+│   └── Trainer.py                  # Distributed black-box Bayesian optimizer (Optuna + CMA-ES)
+├── Patcher/                        # Contest deployment and source code baking tools
+│   ├── Patcher.py                  # Automated .env -> C++ source code injector
+│   ├── Submission.cpp              # Self-contained competitive programming submission
+│   └── Submission.cpp.bak          # Automatic backup snapshot
+├── Schedulers/                     # Modular C++ scheduling library
+│   ├── Scheduler.h                 # Re-entrant SchedulerEnv definition & KnobSet struct
+│   └── Scheduler.cpp               # High-performance event handlers & decision engine
+├── Testcases/                      # Workload datasets and split directories
+│   ├── SampleTestcase.txt          # Reference plain-text test case
+│   └── Train/                      # Standardized training datasets
+│       ├── train.jsonl             # Optimization training split
+│       ├── val.jsonl               # Validation gating split
+│       └── holdout.jsonl           # Unbiased generalization test split
+├── Ultility/                       # Diagnostic and parameter extraction utilities
+│   ├── cpp_to_json.py              # Automated C++ source -> JSON knob extractor
+│   ├── extract_knobs.py            # Streamlined header regex extractor
+│   └── Info.md                     # Utility tool guide
+├── Mathematics.md                  # Comprehensive mathematical derivation & formulas
+├── ProblemStatement.md             # Official competition task specification & protocol
+├── SampleCode.cpp                  # Clean monolithic baseline implementation
+└── main.cpp                        # Interactive contest entry-point executable
 ```
 
 ---
 
-## Trainer.py
+## 🛠 End-to-End Pipeline & Tooling
 
-### Script name
-`Trainer.py`
+```mermaid
+flowchart TD
+    subgraph Generation ["1. Workload Generation"]
+        Calib[Calibration Records] --> Gen[Generator.py]
+        Profiles[19 Stress Profiles] --> Gen
+        Gen --> Datasets[train.jsonl / val.jsonl / holdout.jsonl]
+    end
 
-### Script function
-Black-box parameter optimizer using **Optuna** with the **Tree-structured Parzen Estimator (TPE)** sampler to search all ~40 `KnobSet` parameters in `Scheduler.h` / `Scheduler.cpp`.
+    subgraph Optimization ["2. Parameter Optimization"]
+        Datasets --> Trainer[Trainer.py]
+        Knobs[KnobSet Search Space] --> Trainer
+        Sim[C++ Simulator.exe Engine] <-->|Subprocess Parallel Evals| Trainer
+        Trainer --> Champ[Artifacts/champion.env & champion.json]
+    end
 
-- **Ground-Truth Objective**: Evaluates candidates directly via `Simulator.exe` subprocess calls with OpenMP parallelism and `V4_*` environment variables.
-- **Floor-Raising Monotonic Fitness**: Uses a numerically stable soft-min over per-profile average scores combined with overall mean score to lift weak profiles without degrading strong ones.
-- **Anti-Overfitting & Generalization**:
-  - Independent **Train / Val / Holdout** dataset splits across all 19 stress profiles.
-  - **Multi-Candidate Validation**: Top-3 candidates by train fitness are evaluated on `val.jsonl` at each validation checkpoint, not just the single best.
-  - **Automatic Dataset Sizing**: Checks existing datasets and auto-generates via `Generator.py` if fewer testcases than requested.
-  - **Unbiased Holdout Verification**: Evaluates generalization gap against `holdout.jsonl`.
-- **Stagnation Recovery**: Automatically switches from TPE to **CMA-ES** (Covariance Matrix Adaptation) local refinement after a configurable stagnation window with no champion improvement.
-- **Robust Resume**: On resume from SQLite, restores champion state by re-evaluating the best trial and `champion.json` on the current validation set. Enqueues champion knobs as warm-start.
-- **Persistence & Artifacts**: Checkpoints progress into `study.db` (SQLite) and exports the champion configuration to ready-to-source `.env` (`champion.env`) and JSON metadata (`champion.json`).
-
-### Arguments
-
-| Argument | Type | Required | Default | Description |
-| --- | --- | --- | --- | --- |
-| `--trials`, `-n` | `int` | No | `50` | Number of optimization trials to execute. |
-| `--train-size` | `int` | No | `300` | Number of test cases in `train.jsonl`. |
-| `--val-size` | `int` | No | `150` | Number of test cases in `val.jsonl`. |
-| `--holdout-size` | `int` | No | `150` | Number of test cases in `holdout.jsonl`. |
-| `--threads`, `-t`, `-j` | `int` | No | `0` (hardware max) | OpenMP worker threads for Simulator. |
-| `--val-every` | `int` | No | `10` | Frequency (in trials) to test candidate on validation set. |
-| `--reroll-every` | `int` | No | `0` (disabled) | Frequency (in trials) to re-roll train set with fresh seed. |
-| `--study-name` | `str` | No | `scheduler_knobs` | Optuna study name in SQLite database. |
-| `--storage` | `str` | No | `sqlite:///study.db` | SQLite database URI for persistence / resuming. |
-| `--seed` | `int` | No | `42` | RNG seed for sampler and dataset generation. |
-| `--alpha` | `float` | No | `0.6` | Weight on overall mean score in fitness ($1-\alpha$ on soft-min). |
-| `--beta` | `float` | No | `0.05` | Soft-min sharpness parameter. |
-| `--stagnation-window` | `int` | No | `80` | Trials without improvement before switching to CMA-ES. |
-
-### Script usage
-
-```bash
-# Run standard 50-trial training study
-python Code/Trainer.py --trials 50
-
-# Large-scale training with 26 threads
-python Code/Trainer.py --trials 1500 -t 26 --train-size 16384 --val-size 8192 --holdout-size 8192
-
-# Resume an existing study (champion state auto-restored)
-python Code/Trainer.py --trials 500 -t 26 --study-name study --storage sqlite:///study.db
-
-# Apply exported champion knobs in simulation
-source Artifacts/champion.env
-python Code/Simulator.py Testcases/Train/holdout.jsonl
+    subgraph Deployment ["3. Deployment & Packaging"]
+        Champ --> Patcher[Patcher.py]
+        SubCPP[Submission.cpp] --> Patcher
+        Patcher --> FinalCPP[Self-Contained Final Submission.cpp]
+    end
 ```
 
 ---
 
-## Patcher.py
+### 1. Calibrated Workload Generator (`Generator.py`)
 
-### Script name
-`Patcher.py` (located in `Patcher/`)
+[Generator.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Code/Generator.py) creates mathematically rigorous, diverse test cases across **19 distinct stress-test profiles**.
 
-### Script function
-Automated code patcher that extracts tuned knob values from any `.env` file (e.g. `Artifacts/champion.env`) and injects them directly into C++ submission or scheduler source files (e.g. `Patcher/Submission.cpp` or `Schedulers/Scheduler.h`).
+#### Key Features:
+- **Zero-Score Elimination**: Re-generates any test case that fails or produces 0 points under any known baseline weights.
+- **Rank-Order Consistency**: Formally verifies that superior parameter configurations on the real judge maintain strictly higher aggregate scores on the generated benchmark suite.
+- **Physically Grounded Scaling**: Dynamically aligns $SLO_1$, $SLO_2$, $tp_{\text{base}}$, and $tp_{\text{UB}}$ against theoretical hardware and network lower bounds.
 
-- **Submission-Ready C++**: Prepares self-contained C++ submission files for competitive programming / online judges where environment variables are not set, baking the tuned champion parameters into the fallback defaults.
-- **Flexible Pattern Matching**: Supports `envi(...)` / `envd(...)` fallback arguments, C++ struct member initializers, and static constant assignments.
-- **Safety Features**: Includes `--dry-run` to preview unified diffs before modifying, and `--backup` to create a `.bak` backup file before in-place overwrites.
-
-### Arguments
-
-| Argument | Type | Required | Default | Description |
-| --- | --- | --- | --- | --- |
-| `--env`, `-e` | `str` | No | `Artifacts/champion.env` | Path to `.env` file containing knob definitions. |
-| `--cpp`, `-c` | `str` | No | `Patcher/Submission.cpp` | Path to C++ source file to patch. |
-| `--output`, `-o` | `str` | No | `None` (in-place) | Optional path to write patched file instead of overwriting. |
-| `--backup`, `-b` | flag | No | `False` | Create a `.bak` backup copy before modifying in-place. |
-| `--dry-run` | flag | No | `False` | Show unified diff preview without writing changes. |
-| `--verbose`, `-v` | flag | No | `False` | Print detailed breakdown for every knob. |
-
-### Script usage
+#### CLI Arguments:
+| Argument | Flag | Type | Default | Description |
+|---|---|---|---|---|
+| `num_testcases` | — | `int` | *Required* | Number of test cases to generate. |
+| `--output` | `-o` | `str` | `testcases.jsonl` | Target output JSONL filepath. |
+| `--seed` | `-s` | `int` | `None` | Random seed for deterministic generation. |
+| `--profile` | `-p` | `str` | `None` (mixed) | Generate test cases exclusively for a single profile. |
+| `--list-profiles` | — | flag | `False` | Display all available profile names and exit. |
+| `--no-calibration`| — | flag | `False` | Skip calibration validation against `Calibration/`. |
+| `--calib-dir` | — | `str` | `Calibration` | Path to calibration directory. |
 
 ```bash
-# Preview diff without modifying files
-python Patcher/Patcher.py --env Artifacts/champion.env --cpp Patcher/Submission.cpp --dry-run
+# Generate 100 balanced test cases across all 19 profiles with calibration verification
+python Code/Generator.py 100 -o Testcases/Raw/calibrated_100.jsonl --seed 42
 
-# Patch Submission.cpp in-place with automatic backup
-python Patcher/Patcher.py --env Artifacts/champion.env --cpp Patcher/Submission.cpp --backup
-
-# Patch a custom C++ file and save to a new output path
-python Patcher/Patcher.py -e Artifacts/champion.env -c Patcher/Submission.cpp -o Submissions/Final.cpp
+# Generate 20 test cases focusing on network bottleneck conditions
+python Code/Generator.py 20 -p network_bottleneck -o Testcases/Raw/net_bottleneck.jsonl
 ```
 
+---
 
+### 2. Multi-Threaded Discrete-Event Simulator (`Simulator.py` / `Simulator.cpp`)
+
+The simulation engine is written in performance-tuned C++ ([Simulator.cpp](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Code/Simulator.cpp)) with multi-core OpenMP parallelization, orchestrated through a flexible Python interface ([Simulator.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Code/Simulator.py)).
+
+#### Key Features:
+- **100% Protocol Fidelity**: Simulates full interactive event frames (`ARR`, `TDN`, `XDN`, `FIN`), piecewise interpolation, and exact score clamping.
+- **Zero Heap Allocations**: Utilizes stack-allocated circular buffers and pre-allocated state arrays, processing thousands of simulations per second.
+- **Auto-Compilation**: Automatically detects and invokes `g++`, `clang++`, or MSVC `cl.exe` with `-O3 -fopenmp` flags.
+
+#### CLI Arguments:
+| Argument | Flag | Type | Default | Description |
+|---|---|---|---|---|
+| `testcases` | — | `str` | `Testcases/Raw/testcases.jsonl` | Input JSONL test cases file. |
+| `--threads` | `-t`, `-j` | `int` | `0` (all cores) | Number of concurrent OpenMP worker threads. |
+| `--repeat` | `-r` | `int` | `1` | Evaluation iterations (useful for benchmarking). |
+| `--profile` | `-p` | `str` | `""` (all) | Filter evaluation to a specific profile. |
+| `--verbose` | `-v` | flag | `False` | Print per-testcase breakdown table. |
+| `--json` | — | flag | `False` | Output aggregate results in JSON format. |
+| `--rebuild` | — | flag | `False` | Force re-compilation of C++ simulator binary. |
+
+```bash
+# Run multi-threaded simulation across all CPU cores with detailed summary
+python Code/Simulator.py Testcases/Train/val.jsonl -v
+
+# Run 100 benchmark passes to measure engine execution speed
+python Code/Simulator.py Testcases/Train/holdout.jsonl -r 100
+
+# Direct execution via native binary
+./Code/Simulator.exe -i Testcases/Train/val.jsonl -v
+```
+
+---
+
+### 3. Autonomous Black-Box Hyperparameter Trainer (`Trainer.py`)
+
+[Trainer.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Code/Trainer.py) uses **Optuna** and **CMA-ES** to discover globally optimal configurations for the mathematical knobs in [`KnobSet`](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Schedulers/Scheduler.h#L18).
+
+#### Key Architecture:
+- **Cyclic Multi-Phase Search**:
+  1. *Multivariate TPE*: Models correlated parameter interactions.
+  2. *IPOP CMA-ES*: Local covariance matrix adaptation with restart schedules.
+  3. *Multi-Scale Elite Mutation*: Escapes local minima via structured parameter noise.
+  4. *Basin Jump & Re-anchoring*: Explores alternate fitness landscapes.
+- **Power-Mean Soft-Min Fitness**: Prevents edge-case overfitting by optimizing lower-bound profile scores without sacrificing high-performing profiles.
+- **Strict Anti-Overfitting Partitions**: Enforces rigorous `Train` (optimization), `Val` (promotion gating), and `Holdout` (unbiased testing) isolation.
+- **Automatic State Resumption**: Checkpoints trials into `study.db` (SQLite) and re-evaluates champion states on startup.
+
+#### CLI Arguments:
+| Argument | Flag | Type | Default | Description |
+|---|---|---|---|---|
+| `--trials` | `-n` | `int` | `50` | Number of optimization trials to execute. |
+| `--train-size` | — | `int` | `300` | Number of training split test cases. |
+| `--val-size` | — | `int` | `150` | Number of validation split test cases. |
+| `--holdout-size`| — | `int` | `150` | Number of holdout split test cases. |
+| `--threads` | `-t`, `-j` | `int` | `0` (all cores) | Simulator OpenMP concurrency. |
+| `--val-every` | — | `int` | `10` | Frequency of full validation checkpoints. |
+| `--reroll-every`| — | `int` | `0` (disabled) | Frequency of dynamic trainset re-rolls. |
+| `--study-name` | — | `str` | `scheduler_knobs`| SQLite Optuna study identifier. |
+| `--storage` | — | `str` | `sqlite:///study.db` | Persistence database URI. |
+| `--seed` | — | `int` | `42` | Global random seed. |
+| `--stagnation-window` | — | `int` | `80` | Trials without gain before triggering CMA-ES. |
+
+```bash
+# Run standard 100-trial optimization study
+python Code/Trainer.py --trials 100 -t 16
+
+# Run large-scale search on dedicated cluster with SQLite persistence
+python Code/Trainer.py --trials 2000 -t 32 --train-size 8192 --val-size 4096 --holdout-size 4096 --storage sqlite:///Artifacts/study.db
+```
+
+---
+
+### 4. Real Judge Calibration Suite (`Calibration/`)
+
+The calibration framework guarantees alignment between local simulation scores and real contest judge evaluations.
+
+Supported formats inside `Calibration/`:
+- **JSON Format (`*.json`)**:
+  ```json
+  {
+    "real_score": 142.50,
+    "knobs": {
+      "W1": 7.89, "W2": 11.27, "W3": 0.062, "B1": 20.96,
+      "W4": 0.73, "W5": 2.53,  "B2": 5.59,  "W6": 17.16,
+      "B3": 9.14, "URG_SCALE": 19.88
+    }
+  }
+  ```
+- **Bash Environment Files (`*.env`)**:
+  ```bash
+  # Real Score: 142.50
+  export V4_W1=7.890956405387031
+  export V4_W2=11.2703639160081
+  ```
+- **Unified Manifest (`calibration.json` / `calibration.csv`)**: Multi-run tabular calibration logs.
+
+---
+
+### 5. Automated Submission Patcher (`Patcher.py`)
+
+[Patcher.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Patcher/Patcher.py) reads champion parameters from `.env` files and injects them directly into standalone C++ source files for competition submission.
+
+#### CLI Arguments:
+| Argument | Flag | Type | Default | Description |
+|---|---|---|---|---|
+| `--env` | `-e` | `str` | `Artifacts/champion.env` | Source `.env` configuration file. |
+| `--cpp` | `-c` | `str` | `Patcher/Submission.cpp` | C++ target file to patch. |
+| `--output` | `-o` | `str` | `None` (in-place) | Output path for patched file. |
+| `--backup` | `-b` | flag | `False` | Create `.bak` backup copy before modifying. |
+| `--dry-run` | — | flag | `False` | Print unified diff preview without modifying. |
+| `--verbose` | `-v` | flag | `False` | Detailed log for every replaced variable. |
+
+```bash
+# Preview diff before applying
+python Patcher/Patcher.py -e Artifacts/champion.env -c Patcher/Submission.cpp --dry-run
+
+# Apply tuned parameters in-place with backup
+python Patcher/Patcher.py -e Artifacts/champion.env -c Patcher/Submission.cpp --backup
+```
+
+---
+
+### 6. C++ Knob Extraction Utilities (`cpp_to_json.py`)
+
+[cpp_to_json.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Ultility/cpp_to_json.py) parses C++ source code, header declarations, or console snippets and exports standardized JSON calibration objects.
+
+```bash
+# Extract parameters from source file
+python Ultility/cpp_to_json.py main.cpp -o Calibration/main_knobs.json
+
+# Interactive console mode (paste code block and press Ctrl+D/Ctrl+Z)
+python Ultility/cpp_to_json.py
+```
+
+---
+
+## 🚀 Quick Start Guide
+
+### Prerequisites
+- **C++ Compiler**: GCC (`g++` $\ge 9.0$), Clang (`clang++` $\ge 11.0$), or MSVC with OpenMP support.
+- **Python**: $\ge 3.10$
+- **Dependencies**:
+  ```bash
+  pip install optuna orjson tabulate
+  ```
+
+### Building and Running the Standalone Scheduler
+
+```bash
+# Compile the production scheduler
+g++ -O3 -std=c++17 main.cpp -o scheduler_app
+
+# Run interactively with standard I/O
+./scheduler_app
+```
+
+### Running Simulations & Benchmarks
+
+```bash
+# 1. Generate validation suite
+python Code/Generator.py 500 -o Testcases/Train/val.jsonl --seed 1234
+
+# 2. Run simulation evaluation
+python Code/Simulator.py Testcases/Train/val.jsonl -v
+```
+
+### Optimizing Hyperparameters
+
+```bash
+# Run training study to discover new champion knobs
+python Code/Trainer.py --trials 200 --train-size 1024 --val-size 512 -t 16
+```
+
+### Packaging Contest Submissions
+
+```bash
+# Bake latest champion configuration into contest submission file
+python Patcher/Patcher.py -e Artifacts/champion.env -c Patcher/Submission.cpp -o FinalSubmission.cpp
+```
+
+---
+
+## 🧪 19 Stress-Test Profiles
+
+To ensure robust generalization, [Generator.py](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Code/Generator.py) tests the scheduler across 19 adversarial workload regimes:
+
+| Profile Name | Characteristic Dimensions | Stress Target |
+|---|---|---|
+| `network_bottleneck` | High latency ($35\text{ ms}$), low bandwidth ($0.05\text{ Gbps}$) | Network FIFO queuing & serialization |
+| `fast_network` | Microsecond latency, $100\text{ Gbps}$ bandwidth | Zero-delay link scheduling |
+| `compute_bottleneck` | High table compute durations, high $S$ | Compute resource contention |
+| `high_schedule_cost` | $S \approx 10\text{ ms}$ | Batch aggregation efficiency |
+| `throughput_only` | $w_{\text{tp}} = 1.0, w_c = 0.0$ | Pure token output rate maximization |
+| `latency_only` | $w_{\text{tp}} = 0.0, w_c = 1.0$ | Strict TDR and TPOT deadline preservation |
+| `balanced` | $w_{\text{tp}} = 0.5, w_c = 0.5$, moderate parameters | General operational equilibrium |
+| `single_remote` | $K = 1$ | No multi-worker distribution choice |
+| `many_remotes` | $K = 8$ (maximum allowable) | High-concurrency load balancing |
+| `burst_arrivals` | All $R$ requests arrive at $t = 0$ | Surge prefill scheduling & memory buffers |
+| `streaming_arrivals` | Inter-arrival gaps up to $500\text{ ms}$ | Sparse queue hold/release dynamics |
+| `large_prefill` | Large $L_{\text{in}} \le 4096$ | Input stage transfer & prefill pressure |
+| `long_decode` | Large $L_{\text{out}} \le 512$ | Long-term decode holding stability |
+| `many_layers` | $\text{num\_layers} = 64$ | Multi-piece prefill splitting granularity |
+| `single_layer` | $\text{num\_layers} = 1$ | Prefill splitting disabled |
+| `heavy_transfer` | $\text{bytes\_per\_token} \approx 500{,}000$ | Memory footprint and transfer bandwidth |
+| `stress_scale` | Near-maximum $R$, $K$, and table constraints | System throughput limits |
+| `adversarial_mixed` | Mismatched compute/network bottlenecks | Anti-heuristic robustness |
+| `random` | Uniform random sampling across constraint space | Arbitrary edge-case discovery |
+
+---
+
+## 🎛 Mathematical Hyperparameter Knobs
+
+The scheduler's decision thresholds are parameterized by 10 mathematical knobs in [`KnobSet`](file:///c:/Users/Samarth/Downloads/Edge-Cloud-Scheduler/Schedulers/Scheduler.h#L18):
+
+| Knob Name | Description | Default Champion Value | Search Bounds |
+|---|---|---|---|
+| `W1` | Weight of schedule cost $S$ in decode batching target $\beta$ | `7.890956` | $[0.0, 12.0]$ |
+| `W2` | Weight of normalized throughput weight in $\beta$ | `11.270364` | $[0.0, 12.0]$ |
+| `W3` | Weight of $\text{SLO}_2$ in decode batching target $\beta$ | `0.062483` | $[0.0, 1.0]$ |
+| `B1` | Base additive bias in decode batching target $\beta$ | `20.968952` | $[-10.0, 25.0]$ |
+| `W4` | Weight of $\text{SLO}_2$ in decode holding time-to-live $\tau$ | `0.732383` | $[0.0, 3.0]$ |
+| `W5` | Weight of network latency in holding time-to-live $\tau$ | `2.535072` | $[0.0, 3.0]$ |
+| `B2` | Base additive bias in holding time-to-live $\tau$ | `5.590653` | $[-10.0, 20.0]$ |
+| `W6` | Weight of input length ($L_{\text{in}} / 1000$) in chunk count $\gamma$ | `17.162321` | $[0.0, 25.0]$ |
+| `B3` | Base additive bias in chunk count $\gamma$ | `9.145199` | $[-10.0, 20.0]$ |
+| `URG_SCALE`| Global multiplier for latency urgency prioritization | `19.887632` | $[0.1, 25.0]$ |
+
+---
+
+## 📊 Scoring Formula & Metrics
+
+The official evaluation assigns a normalized score in $[0, 1000]$ per test case:
+
+$$\text{Score} = 1000 \cdot \left[ w_{\text{tp}} \cdot \text{clamp}\left(tp;\; tp_{\text{base}},\, tp_{\text{UB}}\right) + w_c \cdot \text{clamp}\left(dist;\; dist_{\text{base}},\, 0\right) \right]$$
+
+### 1. Throughput Component
+$$tp = \frac{\sum_{i=0}^{R-1} L_{\text{out}}[i]}{\max_i(\text{FinalToken}_i) - \min_i(\text{Arrival}_i)} \quad (\text{tokens/ms})$$
+
+$$\text{Throughput Component} = \max\left(0,\, \min\left(1,\, \frac{tp - tp_{\text{base}}}{tp_{\text{UB}} - tp_{\text{base}}}\right)\right)$$
+
+### 2. Waiting-Time (Latency) Component
+- **$\text{TDR}$**: Mean duration from arrival to prefill completion ($\text{P POST}$).
+- **$\text{TPOT}$**: Mean interval between consecutive token emissions ($\text{D POST}$) across all requests.
+
+$$excess_{\text{TDR}} = \max\left(0,\, \frac{\text{TDR} - \text{SLO}_1}{\text{SLO}_1}\right), \quad excess_{\text{TPOT}} = \max\left(0,\, \frac{\text{TPOT} - \text{SLO}_2}{\text{SLO}_2}\right)$$
+
+$$dist = \sqrt{excess_{\text{TDR}}^2 + excess_{\text{TPOT}}^2}$$
+
+$$\text{Waiting-Time Component} = \begin{cases} \max\left(0,\, 1 - \frac{dist}{dist_{\text{base}}}\right) & \text{if } dist_{\text{base}} > 0 \\ 1 & \text{if } dist_{\text{base}} = 0 \text{ and } dist = 0 \\ 0 & \text{if } dist_{\text{base}} = 0 \text{ and } dist > 0 \end{cases}$$
+
+---
+
+## 🛡 Verification & Zero-Score Safety Rules
+
+> [!CAUTION]
+> The evaluation judge assigns an **immediate 0 score** for any of the following infractions. The scheduler implementation includes strict guards against all of them:
+
+1. **Resource Collision**: Assigning a task to a busy computer, or dispatching multiple tasks to the same resource in a single tick.
+2. **Premature Dispatch**: Scheduling a task before all prerequisite `ARR`, `TDN`, or `XDN` events have been explicitly delivered.
+3. **In-Flight / Finished Reuse**: Including a request that is currently in-flight or has already completed (`FIN`).
+4. **Invalid Cloud Assignment**: Mismatching remote server IDs across prefill or decode steps.
+5. **Malformed Chunk Ranges**: Non-contiguous, empty, or out-of-bounds layer ranges $[ls, le)$.
+6. **Liveness Violation (Stuck State)**: Halting task dispatches when unfinished requests remain and no in-flight transfers or future events exist.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License. See `LICENSE` for details.
