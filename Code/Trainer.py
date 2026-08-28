@@ -58,59 +58,30 @@ from Simulator import ensure_binary
 
 
 # ============================ KNOB SPECIFICATIONS ============================
-# Default values from Scheduler.h KnobSet, with derived physical bounds.
+# Mathematical parameters from Mathematics.md & Schedulers/Scheduler.h.
 
 KNOB_SPECS: dict[str, dict[str, Any]] = {
-    # -- Discrete / Integer Knobs --
-    "SPT":              {"type": "int", "low": 0, "high": 1, "default": 1},
-    "CHUNK":            {"type": "int", "low": 0, "high": 1, "default": 1},
-    "HOLD":             {"type": "int", "low": -1, "high": 1, "default": 1},
-    "UPPRE_MAX":        {"type": "int", "low": 1, "high": 64, "default": 9},
-    "UPPRE_MAX_TP":     {"type": "int", "low": 1, "high": 64, "default": 13},
-    "WAVES_PROC":       {"type": "int", "low": 0, "high": 1, "default": 0},
-    "LATHOLD":          {"type": "int", "low": 0, "high": 1, "default": 0},
-    "CONS":             {"type": "int", "low": 0, "high": 1, "default": 1},
-    "AGE_NORM":         {"type": "int", "low": 0, "high": 1, "default": 0},
-    "CHUNK_PRED":       {"type": "int", "low": 0, "high": 1, "default": 0},
-    "HOLD_ACT":         {"type": "int", "low": 1, "high": 128, "default": 39},
-    "WAVE_CAPS_BATCH":  {"type": "int", "low": 0, "high": 1, "default": 0},
+    # -- Dynamic Decode Batching (beta) per Mathematics.md §11-16, §18-19 --
+    "W1":           {"type": "float", "low": 0.0, "high": 2.0, "default": 0.40},   # weight of S
+    "W2":           {"type": "float", "low": 0.0, "high": 5.0, "default": 1.50},   # weight of w_tp ratio
+    "W3":           {"type": "float", "low": 0.0, "high": 0.1, "default": 0.02},   # weight of SLO2
+    "B1":           {"type": "float", "low": 0.5, "high": 4.0, "default": 1.00},   # bias
 
-    # -- Fractions / Ratios in [0, 1] --
-    "HOLD_WFRAC":       {"type": "float", "low": 0.0, "high": 1.0, "default": 0.311336180161816},
-    "UPGATE_FRAC":      {"type": "float", "low": 0.0, "high": 1.0, "default": 0.133183223107648},
-    "RATE_EFF":         {"type": "float", "low": 0.01, "high": 1.0, "default": 0.785281063030896},
-    "LATFRAC":          {"type": "float", "low": 0.0, "high": 1.0, "default": 0.784885482322511},
-    "HOLD_AW":          {"type": "float", "low": 0.0, "high": 1.0, "default": 0.691000184000935},
+    # -- Decode Time-to-Live (tau) per Mathematics.md §Algorithmic Workflow --
+    "W4":           {"type": "float", "low": 0.05, "high": 0.8, "default": 0.25},  # weight of SLO2
+    "W5":           {"type": "float", "low": 0.05, "high": 0.8, "default": 0.20},  # weight of latency
+    "B2":           {"type": "float", "low": 0.0, "high": 2.0, "default": 0.20},   # bias
 
-    # -- Continuous Scaling / Weights (Wide Physical Intervals) --
-    "BASE_W":           {"type": "float", "low": 0.001, "high": 2500.0, "default": 0.0688174470439218, "log": True},
-    "AGE_SLO_W":        {"type": "float", "low": 0.01, "high": 100.0, "default": 20.5097192909652},
-    "CONS_PEN":         {"type": "float", "low": 0.01, "high": 5000.0, "default": 4.38521352191839, "log": True},
-    "CHUNK_SMULT":      {"type": "float", "low": 5.0, "high": 3000.0, "default": 117.072478194454},
-    "WAVES":            {"type": "float", "low": 0.5, "high": 150.0, "default": 2.6067767581806},
-    "HOLD_SMULT":       {"type": "float", "low": 0.1, "high": 400.0, "default": 35.7840349513665},
-    "DECW":             {"type": "float", "low": 0.05, "high": 100.0, "default": 1.56316454998452},
-    "CHUNK_MINS":       {"type": "float", "low": 2.0, "high": 1000.0, "default": 83.0861287103681},
-    "CHUNK_TPP":        {"type": "float", "low": 0.005, "high": 5.0, "default": 0.709332551776164},
-    "B_DPOST":          {"type": "float", "low": 0.0, "high": 100.0, "default": 4.77937996680665},
-    "B_PPOST":          {"type": "float", "low": 0.0, "high": 100.0, "default": 6.659109487552},
-    "B_DPRE":           {"type": "float", "low": 0.0, "high": 100.0, "default": 2.11491371566828},
-    "B_PPRE":           {"type": "float", "low": 0.0, "high": 100.0, "default": 3.59042054650082},
-    "B_DPROC":          {"type": "float", "low": 0.0, "high": 100.0, "default": 5.46600299914945},
-    "B_PPROC":          {"type": "float", "low": 0.0, "high": 100.0, "default": 0.210235165695655},
-    "AGE_FLOOR":        {"type": "float", "low": 0.0, "high": 50.0, "default": 0.345735897111258},
-    "AGE_AW":           {"type": "float", "low": 0.0, "high": 50.0, "default": 2.16669410499286},
-    "AGE_PRESS":        {"type": "float", "low": 0.0, "high": 30.0, "default": 3.24529577274236},
-    "DECQ":             {"type": "float", "low": 0.01, "high": 60.0, "default": 1.48621187428654},
-    "CHUNK_RATIO":      {"type": "float", "low": 0.001, "high": 100.0, "default": 7.06079186759801},
-    "LAT_MULT":         {"type": "float", "low": 0.1, "high": 50.0, "default": 7.54176800349664},
-    "GATE_TDR":         {"type": "float", "low": 0.01, "high": 10.0, "default": 1.27796897979818},
+    # -- Input Chunking (gamma) per Mathematics.md §9 --
+    "W6":           {"type": "float", "low": 0.5, "high": 6.0, "default": 2.50},   # weight of L_in/1000
+    "B3":           {"type": "float", "low": 0.5, "high": 3.0, "default": 1.00},   # bias
 
-    # -- Soft-Cap Knobs (Log-Scale) --
-    "PPRE_AGECAP":      {"type": "float", "low": 1e3, "high": 1e14, "default": 58607547317.7586, "log": True},
+    # -- Priority Urgency Scaling per Mathematics.md §21-22 --
+    "URG_SCALE":    {"type": "float", "low": 0.5, "high": 2.5, "default": 1.20},
 }
 
 DEFAULT_KNOBS: dict[str, Any] = {name: spec["default"] for name, spec in KNOB_SPECS.items()}
+
 
 
 def suggest_knobs(trial: optuna.Trial) -> dict[str, Any]:
@@ -486,17 +457,18 @@ class KnobTrainer:
                 print(f"[Dataset] Generating {count_needed} testcases for {name} -> {path}...")
                 generate_dataset(count_needed, path, seed=seed)
 
-        if train_count < self.train_size:
-            print(f"[Dataset] Train set has {train_count} testcases (need {self.train_size}).")
+        if train_count != self.train_size:
+            print(f"[Dataset] Train set has {train_count} testcases (need {self.train_size}). Regenerating...")
             _generate(self.train_size, self.train_path, self.seed, "Train")
 
-        if val_count < self.val_size:
-            print(f"[Dataset] Val set has {val_count} testcases (need {self.val_size}).")
+        if val_count != self.val_size:
+            print(f"[Dataset] Val set has {val_count} testcases (need {self.val_size}). Regenerating...")
             _generate(self.val_size, self.val_path, self.seed + 1000, "Validation")
 
-        if holdout_count < self.holdout_size:
-            print(f"[Dataset] Holdout set has {holdout_count} testcases (need {self.holdout_size}).")
+        if holdout_count != self.holdout_size:
+            print(f"[Dataset] Holdout set has {holdout_count} testcases (need {self.holdout_size}). Regenerating...")
             _generate(self.holdout_size, self.holdout_path, self.seed + 2000, "Holdout")
+
 
     def evaluate_dataset(self, dataset_path: Path, knobs: dict[str, Any]) -> tuple[float, dict[str, float], int, int]:
         """Evaluate a dataset and return (avg_score, profile_means, valid_count, total)."""

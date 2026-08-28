@@ -72,14 +72,12 @@ def patch_cpp_content(content: str, knobs: dict[str, str]) -> tuple[str, list[di
         except ValueError:
             formatted_val = new_val
 
-        # Pattern 1: envi("V4_NAME", <old_val>) or envd("V4_NAME", <old_val>)
-        # Matches: envi("V4_SPT", 1) -> envi("V4_SPT", <new_val>)
+        # Pattern 1: env fallback calls (e.g. envd("V4_W1", <val>), envi("V4_SPT", <val>))
         p1 = re.compile(
             rf'(env[id]\s*\(\s*"V4_{re.escape(name)}"\s*,\s*)([^)]+?)(\s*\))'
         )
 
-        # Pattern 2: Struct initializers (e.g. in Scheduler.h)
-        # Matches: int SPT = 1; -> int SPT = <new_val>;
+        # Pattern 2: Struct initializers (e.g. double W1 = 0.7774; int SPT = 1;)
         p2 = re.compile(
             rf'((?:int|double|float|int32_t|int64_t)\s+{re.escape(name)}\s*=\s*)([^;]+?)(;)'
         )
@@ -92,24 +90,17 @@ def patch_cpp_content(content: str, knobs: dict[str, str]) -> tuple[str, list[di
         matched = False
         old_val_str = ""
 
-        def repl1(m: re.Match) -> str:
+        def repl_func(m: re.Match) -> str:
             nonlocal matched, old_val_str
             matched = True
-            old_val_str = m.group(2).strip()
+            if not old_val_str:
+                old_val_str = m.group(2).strip()
             return f"{m.group(1)}{formatted_val}{m.group(3)}"
 
-        patched, count1 = p1.subn(repl1, patched)
-
-        if not count1:
-            def repl2(m: re.Match) -> str:
-                nonlocal matched, old_val_str
-                matched = True
-                old_val_str = m.group(2).strip()
-                return f"{m.group(1)}{formatted_val}{m.group(3)}"
-
-            patched, count2 = p2.subn(repl2, patched)
-            if not count2:
-                patched, count3 = p3.subn(repl2, patched)
+        # Patch all occurrences in the content
+        patched, c2 = p2.subn(repl_func, patched)
+        patched, c1 = p1.subn(repl_func, patched)
+        patched, c3 = p3.subn(repl_func, patched)
 
         if matched:
             changes.append({
@@ -118,6 +109,7 @@ def patch_cpp_content(content: str, knobs: dict[str, str]) -> tuple[str, list[di
                 "new": formatted_val,
                 "status": "UPDATED" if old_val_str != formatted_val else "UNCHANGED",
             })
+
         else:
             changes.append({
                 "knob": name,
